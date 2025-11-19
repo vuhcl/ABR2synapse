@@ -8,20 +8,20 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
 def RF_data_prep(
-    data, target="SynapsesPerIHC", num_features=None, cat_features=None
+    data, num_features, cat_features, target="SynapsesPerIHC"
 ):  # features='default'):
-    if num_features is None:
-        num_features = [
-            "Frequency(kHz)",
-            "Level(dB)",
-            "Amplitude",
-            "Noise",
-            "Time (hrs)",
-        ]
-    if cat_features is None:
-        cat_features = [
-            "Strain (binary)",
-        ]
+    # if num_features is None:
+    #     num_features = [
+    #         "Frequency(kHz)",
+    #         "Level(dB)",
+    #         "Amplitude",
+    #         "Noise",
+    #         "Time (hrs)",
+    #     ]
+    # if cat_features is None:
+    #     cat_features = [
+    #         "Strain (binary)",
+    #     ]
     X = data[num_features + cat_features]
     y = data[target]
 
