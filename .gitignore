@@ -1,0 +1,97 @@
+# --- Python / tooling cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Generic cache dirs ---
+.cache/
+*.cache
+
+# --- Virtual environments ---
+.venv/
+venv/
+ENV/
+env/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Local scratch (names starting with underscore) ---
+_*
+!**/__init__.py
+!**/__main__.py
+
+# --- Nested repo metadata (track this project from Practicum root only) ---
+.git/
+
+# --- Artifacts: tabular / serialized data ---
+*.parquet
+*.parq
+*.feather
+*.orc
+*.avro
+*.pkl
+*.pickle
+*.joblib
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# --- Artifacts: structured text / exports ---
+*.json
+*.jsonl
+*.ndjson
+*.html
+*.htm
+*.xml
+
+# --- Artifacts: images ---
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.tif
+*.tiff
+*.ico
+*.svg
+
+# --- Artifacts: archives / large binaries ---
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.bz2
+*.xz
+*.7z
+*.rar
+
+# --- ML / experiment outputs (common defaults) ---
+wandb/
+mlruns/
+lightning_logs/
+runs/
+outputs/
+artifacts/
