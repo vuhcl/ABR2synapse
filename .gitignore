@@ -40,8 +40,11 @@ _*
 !**/__init__.py
 !**/__main__.py
 
-# --- Nested repo metadata (track this project from Practicum root only) ---
+# --- Nested repo metadata ---
 .git/
+
+# --- Git bundle backups ---
+*.bundle
 
 # --- Artifacts: tabular / serialized data ---
 *.parquet
