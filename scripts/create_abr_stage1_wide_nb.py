@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Create abr_stage1_wide.ipynb and optionally execute export cell."""
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+NB = ROOT / "abr_stage1_wide.ipynb"
+
+cells = [
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "# Stage 1 wide noise classifiers (canonical)\n",
+            "\n",
+            "SPL **50 / 60 / 70 / 80** only. **Train/Fit** → **Validate** row-level accuracy for HP / RF-vs-LR selection → "
+            "**Youden threshold on Fit+Validate animals** (full calibration) → **Test** animal acc + AUC.\n",
+            "\n",
+            "Summary table reports **fit / val / non-test / test** metrics. "
+            "`non_test_acc_animal` is **animal-level only** (mean row proba per animal → Youden on Fit+Val → "
+            "one label per `animal_id`, broadcast to wide/long rows as `noise_preds`).\n",
+            "\n",
+            "Artifacts: `figures/cache/`.\n",
+        ],
+    },
+    {
+        "cell_type": "code",
+        "metadata": {},
+        "source": [
+            "import importlib\n",
+            "import sklearn\n",
+            "\n",
+            "import utils.nn_stage2 as nn2\n",
+            "import utils.nn_stage2_data as nn2d\n",
+            "import utils.stage1_wide_report as s1r\n",
+            "\n",
+            "importlib.reload(nn2d)\n",
+            "importlib.reload(nn2)\n",
+            "importlib.reload(s1r)\n",
+            "\n",
+            "from utils.nn_stage2 import (\n",
+            "    fit_stage1_wide_best,\n",
+            "    fit_stage1_wide_logistic,\n",
+            "    fit_stage1_wide_rf,\n",
+            ")\n",
+            "from utils.nn_stage2_data import (\n",
+            "    STAGE_SPL_LEVELS,\n",
+            "    load_nn_stage2_data,\n",
+            "    splits_for_long_stage2,\n",
+            "    wide_columns_at_stage_spl,\n",
+            "    wide_stage1_fit,\n",
+            "    wide_stage1_val,\n",
+            ")\n",
+            "from utils.stage1_wide_report import export_stage1_artifacts, stage1_summary_table\n",
+        ],
+        "outputs": [],
+        "execution_count": None,
+    },
+    {
+        "cell_type": "code",
+        "metadata": {},
+        "source": [
+            "data = load_nn_stage2_data()\n",
+            "sp = splits_for_long_stage2(data)\n",
+            "bb_tr = sp[\"bb_wide_train\"]\n",
+            "bb_te = sp[\"bb_wide_test\"]\n",
+            "lib_tr = sp[\"lib_train\"]\n",
+            "lib_te = sp[\"lib_test\"]\n",
+            "\n",
+            "for name, cols in [(\"BB\", bb_tr.columns), (\"Lib\", lib_tr.columns)]:\n",
+            "    spl = wide_columns_at_stage_spl(cols)\n",
+            "    print(f\"{name}: {len(spl)} SPL 50-80 pivot cols (expect >0); levels={STAGE_SPL_LEVELS}\")\n",
+        ],
+        "outputs": [],
+        "execution_count": None,
+    },
+    {
+        "cell_type": "code",
+        "metadata": {},
+        "source": [
+            "bb_fit = wide_stage1_fit(bb_tr)\n",
+            "bb_val = wide_stage1_val(bb_tr)\n",
+            "lib_fit = wide_stage1_fit(lib_tr)\n",
+            "lib_val = wide_stage1_val(lib_tr)\n",
+            "\n",
+            "print(\"Brad Buran wide (RF)\")\n",
+            "s1_bb_rf = fit_stage1_wide_rf(bb_fit, bb_val, bb_te, data.noise_num_bb, data.noise_log_bb)\n",
+            "print(\"\\nBrad Buran wide (LR)\")\n",
+            "s1_bb_lr = fit_stage1_wide_logistic(bb_fit, bb_val, bb_te, data.noise_num_bb, data.noise_log_bb)\n",
+            "print(\"\\nBrad Buran wide (best)\")\n",
+            "s1_bb_best = fit_stage1_wide_best(bb_fit, bb_val, bb_te, data.noise_num_bb, data.noise_log_bb)\n",
+            "display(stage1_summary_table(s1_bb_best[\"candidates\"], s1_bb_best[\"stage1_model\"]))\n",
+        ],
+        "outputs": [],
+        "execution_count": None,
+    },
+    {
+        "cell_type": "code",
+        "metadata": {},
+        "source": [
+            "print(\"Liberman wide (RF)\")\n",
+            "s1_lib_rf = fit_stage1_wide_rf(lib_fit, lib_val, lib_te, data.noise_num_lib, data.noise_log_lib)\n",
+            "print(\"\\nLiberman wide (LR)\")\n",
+            "s1_lib_lr = fit_stage1_wide_logistic(lib_fit, lib_val, lib_te, data.noise_num_lib, data.noise_log_lib)\n",
+            "print(\"\\nLiberman wide (best)\")\n",
+            "s1_lib_best = fit_stage1_wide_best(lib_fit, lib_val, lib_te, data.noise_num_lib, data.noise_log_lib)\n",
+            "display(stage1_summary_table(s1_lib_best[\"candidates\"], s1_lib_best[\"stage1_model\"]))\n",
+        ],
+        "outputs": [],
+        "execution_count": None,
+    },
+    {
+        "cell_type": "code",
+        "metadata": {},
+        "source": [
+            "paths = export_stage1_artifacts(\n",
+            "    s1_bb_best,\n",
+            "    s1_lib_best,\n",
+            "    s1_bb_rf,\n",
+            "    s1_bb_lr,\n",
+            "    s1_lib_rf,\n",
+            "    s1_lib_lr,\n",
+            "    sklearn_version=sklearn.__version__,\n",
+            ")\n",
+            "for k, p in paths.items():\n",
+            "    print(k, p.resolve())\n",
+        ],
+        "outputs": [],
+        "execution_count": None,
+    },
+]
+
+nb = {
+    "nbformat": 4,
+    "nbformat_minor": 5,
+    "metadata": {
+        "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+        "language_info": {"name": "python"},
+    },
+    "cells": cells,
+}
+NB.write_text(json.dumps(nb, indent=1))
+print("Wrote", NB)
