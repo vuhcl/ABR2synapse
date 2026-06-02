@@ -2,26 +2,21 @@ import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+from utils.subject_cv import (
+    DEFAULT_CV_RANDOM_STATE,
+    build_subject_cv,
+    prepare_xy_groups,
+    resolve_subject_col,
+    train_only_frame,
+)
 
 
 def RF_data_prep(
     data, num_features, cat_features, target="SynapsesPerIHC"
 ):  # features='default'):
-    # if num_features is None:
-    #     num_features = [
-    #         "Frequency(kHz)",
-    #         "Level(dB)",
-    #         "Amplitude",
-    #         "Noise",
-    #         "Time (hrs)",
-    #     ]
-    # if cat_features is None:
-    #     cat_features = [
-    #         "Strain (binary)",
-    #     ]
     X = data[num_features + cat_features]
     y = data[target]
 
@@ -43,14 +38,32 @@ def RF_data_prep(
 
 
 def RF_cross_validation(
-    data, num_features=None, cat_features=None, model="default", folds=5, random_state=1
+    data,
+    num_features=None,
+    cat_features=None,
+    model="default",
+    folds=5,
+    random_state=DEFAULT_CV_RANDOM_STATE,
 ):
-
     X_train, X_test, y_train, y_test, preprocessor = RF_data_prep(
         data, num_features=num_features, cat_features=cat_features
     )
 
-    k_folds = KFold(n_splits=folds)
+    target_col = "SynapsesPerIHC"
+    tune_frame = train_only_frame(data)
+    id_col = resolve_subject_col(tune_frame)
+    feat_cols = list(num_features or []) + list(cat_features or [])
+    X_tune, y_tune, groups, _ = prepare_xy_groups(
+        tune_frame, feat_cols, target_col, id_col
+    )
+
+    cv = build_subject_cv(
+        y_tune.to_numpy(),
+        groups,
+        n_splits=folds,
+        random_state=random_state,
+        prefer_stratified=False,
+    )
     cv_scores = []
     rmse_scores = []
 
@@ -62,14 +75,16 @@ def RF_cross_validation(
             min_samples_leaf=5,
         )
 
-    for fold_idx, (train_idx, val_idx) in enumerate(k_folds.split(X_train)):
-        # Split the training data into training and validation sets for this fold
-        X_fold_train, X_fold_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
-        y_fold_train, y_fold_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+    X_arr = X_tune.to_numpy() if hasattr(X_tune, "to_numpy") else np.asarray(X_tune)
+    y_arr = y_tune.to_numpy()
 
-        # Create Random Forest Pipeline
+    for train_idx, val_idx in cv.split(X_arr, y_arr, groups):
+        X_fold_train = X_tune.iloc[train_idx]
+        X_fold_val = X_tune.iloc[val_idx]
+        y_fold_train = y_tune.iloc[train_idx]
+        y_fold_val = y_tune.iloc[val_idx]
+
         rf_pipeline = Pipeline([("preprocessing", preprocessor), ("rf", model)])
-
         rf_pipeline.fit(X_fold_train, y_fold_train)
         y_pred = rf_pipeline.predict(X_fold_val)
 
