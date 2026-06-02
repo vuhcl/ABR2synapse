@@ -10,6 +10,7 @@ Liberman long rows keep ``WaveI`` (30-sample window) and ``full_waveform`` (full
 from __future__ import annotations
 
 import os
+import re
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +21,8 @@ from scipy.interpolate import CubicSpline
 from sklearn.model_selection import train_test_split
 
 from utils.data_loader import load_data
-from utils.feature_extraction import amplitude_vs_spl_slopes, slope_from_amplitude_distance
+from utils.feature_extraction import (amplitude_vs_spl_slopes,
+                                      slope_from_amplitude_distance)
 
 warnings.filterwarnings("ignore")
 
@@ -29,6 +31,13 @@ WAVE_I_LEN = 30
 # Full-wave CNN: Liberman trace spans 0–17 ms; both cohorts use 0–8 ms window, then resample.
 LIB_FULL_WAVEFORM_MS = 17.0
 FULL_WAVE_WINDOW_MS = (0.0, 8.0)
+
+MOUSE_SPLIT_RANDOM_STATE = 22
+NN_TRAIN_RANDOM_STATE = 1
+STAGE_SPL_LEVELS: tuple[int, ...] = (50, 60, 70, 80)
+
+_WIDE_SPL_LEVEL_SUFFIX_RE = re.compile(r"_(\d+(?:\.\d+)?)$")
+
 
 # Long-format Stage 2 tabular numeric columns
 LONG_NUM_BASE = [
@@ -66,8 +75,6 @@ _PIVOT_COLS = [
 
 _EXTRA_WIDE_FEATURES = ("Slope_all", "Slope_high4", "p1_latency")
 
-# Pivoted wide columns for 40–80 dB band (prefix ``{base}_4…`` matches e.g. ``amplitude_40.0``)
-_WIDE_S2_SPL_PREFIXES: tuple[int, ...] = (4, 5, 6, 7, 8)
 _WIDE_S2_LOG_BASES: tuple[str, ...] = (
     "total_variance",
     "PeakIEarlyCurvature",
@@ -78,6 +85,59 @@ _WIDE_S2_LOG_BASES: tuple[str, ...] = (
     "TroughILateCurvature",
 )
 
+_PIVOT_NUM_BASES: tuple[str, ...] = ("amplitude", "slope", "distance")
+
+
+def parse_wide_spl_level(col: str) -> float | None:
+    """Parse trailing ``_50.0`` style level from a pivoted wide column name."""
+    m = _WIDE_SPL_LEVEL_SUFFIX_RE.search(col)
+    if not m:
+        return None
+    return float(m.group(1))
+
+
+def wide_columns_at_stage_spl(
+    columns,
+    bases: tuple[str, ...] = _PIVOT_NUM_BASES + _WIDE_S2_LOG_BASES,
+    *,
+    levels: tuple[int, ...] = STAGE_SPL_LEVELS,
+) -> list[str]:
+    """Pivoted columns whose parsed dB level is in ``levels``."""
+    allowed = {float(x) for x in levels}
+    out = []
+    for c in columns:
+        for base in bases:
+            if not c.startswith(f"{base}_"):
+                continue
+            lvl = parse_wide_spl_level(c)
+            if lvl is not None and lvl in allowed:
+                out.append(c)
+                break
+    return sorted(set(out))
+
+
+def wide_stage1_fit(wide_df: pd.DataFrame) -> pd.DataFrame:
+    return wide_df.loc[wide_df["DataGroup"] == "Train"].reset_index(drop=True)
+
+
+def wide_stage1_val(wide_df: pd.DataFrame) -> pd.DataFrame:
+    return wide_df.loc[wide_df["DataGroup"] == "Validate"].reset_index(drop=True)
+
+
+def assert_wide_feats_stage_spl(
+    columns: list[str] | tuple[str, ...],
+    *,
+    levels: tuple[int, ...] = STAGE_SPL_LEVELS,
+) -> None:
+    """Raise if any pivoted wide feature column parses to an SPL outside ``levels``."""
+    allowed = {float(x) for x in levels}
+    for col in columns:
+        lvl = parse_wide_spl_level(col)
+        if lvl is not None and lvl not in allowed:
+            raise ValueError(
+                f"Tree wide feature {col!r} uses SPL {lvl}; allowed {levels}"
+            )
+
 
 def syn_feats_from_wide_common(
     common_cols: list | tuple,
@@ -87,26 +147,19 @@ def syn_feats_from_wide_common(
     """
     Stage-2 **wide** tabular features (same logic as ``abr_wide_long_comparison``):
     pivoted ``amplitude`` / ``slope`` / ``distance`` (numeric) and curvature / variance
-    columns (log-scaled) on the 40–80 dB grid, plus ``frequency`` and ``noise_preds``.
+    columns (log-scaled) on the 50/60/70/80 dB grid, plus ``frequency`` and ``noise_preds``.
     Optional extras present in both labs' wide tables: ``Slope_all``, ``Slope_high4``,
     ``p1_latency``; optional ``strain_binary``.
     """
-    common = set(common_cols)
+    common = list(common_cols)
+    spl_cols = set(wide_columns_at_stage_spl(common))
     syn_num: list[str] = []
     syn_log: list[str] = ["frequency"]
     syn_cat: list[str] = ["noise_preds"]
     for base in _WIDE_S2_LOG_BASES:
-        syn_log += sorted(
-            c
-            for c in common
-            if any(c.startswith(f"{base}_{i}") for i in _WIDE_S2_SPL_PREFIXES)
-        )
-    for base in ("amplitude", "slope", "distance"):
-        syn_num += sorted(
-            c
-            for c in common
-            if any(c.startswith(f"{base}_{i}") for i in _WIDE_S2_SPL_PREFIXES)
-        )
+        syn_log += sorted(c for c in common if c in spl_cols and c.startswith(f"{base}_"))
+    for base in _PIVOT_NUM_BASES:
+        syn_num += sorted(c for c in common if c in spl_cols and c.startswith(f"{base}_"))
     for extra in _EXTRA_WIDE_FEATURES:
         if extra in common:
             syn_num.append(extra)
@@ -122,7 +175,7 @@ def split_by_mouse(
     stratify_on="tx",
     test_size=0.2,
     val_size=0.18,
-    random_state=22,
+    random_state=MOUSE_SPLIT_RANDOM_STATE,
     return_idx=False,
 ):
     mice = data[[split_on, stratify_on]].drop_duplicates().set_index(split_on)
@@ -165,20 +218,13 @@ def _noise_feats_from_wide(columns, *, include_extra_wide: bool = False):
     ``include_extra_wide``: when True, add animal×frequency aggregates
     ``Slope_all``, ``Slope_high4``, ``p1_latency`` (same as ``newfeats`` notebook).
     """
-    cols = set(columns)
+    cols = list(columns)
+    spl_cols = set(wide_columns_at_stage_spl(cols))
     num, log = [], ["frequency"]
-    for col in [
-        "total_variance",
-        "PeakIEarlyCurvature",
-        "PeakICentralCurvature",
-        "PeakILateCurvature",
-        "TroughIEarlyCurvature",
-        "TroughICentralCurvature",
-        "TroughILateCurvature",
-    ]:
-        log += sorted(c for c in cols if c.startswith(f"{col}_"))
-    for col in ["amplitude", "slope", "distance"]:
-        num += sorted(c for c in cols if c.startswith(f"{col}_"))
+    for col in _WIDE_S2_LOG_BASES:
+        log += sorted(c for c in cols if c in spl_cols and c.startswith(f"{col}_"))
+    for col in _PIVOT_NUM_BASES:
+        num += sorted(c for c in cols if c in spl_cols and c.startswith(f"{col}_"))
     if include_extra_wide:
         for c in _EXTRA_WIDE_FEATURES:
             if c in cols:
@@ -461,7 +507,9 @@ def _io_slope_lookup(df, level_col="level", amp_col="amplitude"):
     return pd.DataFrame(rows)
 
 
-def _build_reformatted(brad_buran_df: pd.DataFrame) -> pd.DataFrame:
+def _build_reformatted(
+    brad_buran_df: pd.DataFrame, *, join_io_features: bool = False
+) -> pd.DataFrame:
     cols = list(_PIVOT_COLS)
     parts = []
     for col in cols:
@@ -478,16 +526,20 @@ def _build_reformatted(brad_buran_df: pd.DataFrame) -> pd.DataFrame:
     noise = brad_buran_df.groupby(["animal_id", "frequency"])["noise_cat"].mean()
     syn = brad_buran_df.groupby(["animal_id", "frequency"])["synapses"].mean()
     groups = brad_buran_df.groupby(["animal_id", "frequency"])[["DataGroup"]].first()
+    exp_group = brad_buran_df.groupby(["animal_id", "frequency"])["tx"].first().rename(
+        "experimental_group"
+    )
 
-    reformatted = reformatted.join(noise).join(syn).join(groups)
+    reformatted = reformatted.join(noise).join(syn).join(groups).join(exp_group)
     if "strain_binary" in brad_buran_df.columns:
         _sb = brad_buran_df.groupby(["animal_id", "frequency"])["strain_binary"].first()
         reformatted = reformatted.join(_sb)
 
-    _io_extra = brad_buran_df.groupby(["animal_id", "frequency"])[
-        ["Slope_all", "Slope_high4", "p1_latency"]
-    ].first()
-    reformatted = reformatted.join(_io_extra)
+    if join_io_features:
+        _io_extra = brad_buran_df.groupby(["animal_id", "frequency"])[
+            ["Slope_all", "Slope_high4", "p1_latency"]
+        ].first()
+        reformatted = reformatted.join(_io_extra)
 
     for col in cols:
         amp_cols = [c for c in reformatted.columns if c.startswith(col)]
@@ -497,7 +549,9 @@ def _build_reformatted(brad_buran_df: pd.DataFrame) -> pd.DataFrame:
     return reformatted.reset_index()
 
 
-def _build_reformatted_orig(_orig: pd.DataFrame) -> pd.DataFrame:
+def _build_reformatted_orig(
+    _orig: pd.DataFrame, *, join_io_features: bool = False
+) -> pd.DataFrame:
     _dfs = [
         _orig.pivot_table(index=["animal_id", "frequency"], columns="level", values=col)
         .rename_axis(columns="level_dB")
@@ -516,12 +570,17 @@ def _build_reformatted_orig(_orig: pd.DataFrame) -> pd.DataFrame:
 
     reformatted_orig = reformatted_orig.join(
         _orig.groupby(["animal_id", "frequency"])[["DataGroup"]].first()
+    ).join(
+        _orig.groupby(["animal_id", "frequency"])["Group"]
+        .first()
+        .rename("experimental_group")
     )
 
-    _io_lib = _orig.groupby(["animal_id", "frequency"])[
-        ["Slope_all", "Slope_high4", "p1_latency"]
-    ].first()
-    reformatted_orig = reformatted_orig.join(_io_lib)
+    if join_io_features:
+        _io_lib = _orig.groupby(["animal_id", "frequency"])[
+            ["Slope_all", "Slope_high4", "p1_latency"]
+        ].first()
+        reformatted_orig = reformatted_orig.join(_io_lib)
 
     for col in _PIVOT_COLS:
         _cs = [c for c in reformatted_orig.columns if c.startswith(f"{col}_")]
@@ -705,8 +764,7 @@ def _apply_brad_libt_features(joined_df: pd.DataFrame, tw_lib: int) -> pd.DataFr
         _brad_sl, on=["animal_id", "frequency"], how="left"
     )
 
-    brad_buran_df = split_by_mouse(brad_buran_df, stratify_on="tx")
-    return brad_buran_df
+    return split_by_mouse(brad_buran_df, stratify_on="tx")
 
 
 def _build_liberman_orig() -> pd.DataFrame:
@@ -786,8 +844,7 @@ def _build_liberman_orig() -> pd.DataFrame:
         subset=[c for c in _keep if c not in ("p1_latency", "Slope_all", "Slope_high4")]
     )
 
-    _orig = split_by_mouse(_orig, split_on="animal_id", stratify_on="Group")
-    return _orig
+    return split_by_mouse(_orig, split_on="animal_id", stratify_on="Group")
 
 
 def _common_wide_cols(
@@ -840,13 +897,14 @@ def load_nn_stage2_data(
     *,
     full_wave_prefer_liberman_len: bool = True,
     include_extra_wide_features: bool = False,
+    join_io_features: bool = False,
 ) -> NNStage2Data:
     """
     ``share_path`` is the project directory that contains ``abr_data/``, ``abr_io.csv``,
-    and ``synapses.csv`` (the parent of ``ABR2synapse`` when you run the original notebook).
+    and ``synapses.csv`` (the repository root next to the ``utils`` package).
 
-    ``load_data`` uses paths relative to the current working directory; run from
-    ``ABR2synapse`` so ``../liberman_wpz`` resolves like the notebook.
+    ``load_data`` resolves ``liberman_wpz`` from the repo root (see ``utils/data_loader.py``),
+    so it does not depend on the process working directory.
 
     ``full_wave_prefer_liberman_len``: when Brad and Liberman median 0–8 ms crop
     lengths differ, use Liberman's median as the fixed CNN length if True, else Brad's.
@@ -860,14 +918,17 @@ def load_nn_stage2_data(
     (matches ``abr_wide_long_comparison_newfeats``). Default False: Stage 1 uses only
     pivoted level-wise wide columns; Stage 2 uses ``LONG_NUM_BASE`` (amplitude, slope,
     distance, level) plus optional ``strain_binary``.
+
+    ``join_io_features``: when True, join ``Slope_all``, ``Slope_high4``, ``p1_latency``
+    onto wide tables. Default False matches ``abr_wide_long_comparison`` Liberman pivot.
     """
     abr2_root = Path(__file__).resolve().parent.parent
     if share_path is None:
-        share_path = abr2_root.parent
+        share_path = abr2_root
 
     brad_prefeature = _build_brad_prefeature(share_path)
     orig_lib = _build_liberman_orig()
-    reformatted_orig = _build_reformatted_orig(orig_lib)
+    reformatted_orig = _build_reformatted_orig(orig_lib, join_io_features=join_io_features)
 
     tw_lib, mb, ml = compute_full_wave_target_len(
         brad_prefeature,
@@ -875,7 +936,7 @@ def load_nn_stage2_data(
         prefer_liberman_len=True,
     )
     brad_buran_df = _apply_brad_libt_features(brad_prefeature, tw_lib)
-    reformatted = _build_reformatted(brad_buran_df)
+    reformatted = _build_reformatted(brad_buran_df, join_io_features=join_io_features)
 
     common = _common_wide_cols(
         reformatted,
