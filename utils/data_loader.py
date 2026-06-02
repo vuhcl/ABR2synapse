@@ -1,8 +1,16 @@
 import os
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+# Liberman data lives next to this package (repo root), not under ``../`` relative to cwd.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _liberman_dir() -> Path:
+    return _REPO_ROOT / "liberman_wpz"
 
 warnings.filterwarnings("ignore")
 
@@ -99,7 +107,7 @@ def load_data(verbose=False, db_level=70):
         amp_df_full[col] = amp_df_full[col].astype(object)
     idx = 0
 
-    start_path = "../liberman_wpz/WPZ Electrophysiology"
+    start_path = _liberman_dir() / "WPZ Electrophysiology"
     for subject in os.listdir(start_path):
         if not os.path.isdir(os.path.join(start_path, subject)):
             continue
@@ -164,7 +172,7 @@ def load_data(verbose=False, db_level=70):
     )
 
     raw_synapse_counts = pd.read_excel(
-        "../liberman_wpz/WPZ Ribbon and Synapse Counts.xlsx"
+        _liberman_dir() / "WPZ Ribbon and Synapse Counts.xlsx"
     )
     raw_synapse_counts = raw_synapse_counts.mask(lambda x: x.isnull()).dropna()
 
@@ -211,7 +219,7 @@ def load_data(verbose=False, db_level=70):
     final_clean = final.dropna()
 
     # adding in the strain feature
-    strains = pd.read_excel("../liberman_wpz/WPZ Mouse groups.xlsx")
+    strains = pd.read_excel(_liberman_dir() / "WPZ Mouse groups.xlsx")
     final_clean_strained = final_clean.join(strains.set_index("ID#"), on="Subject")
     final_clean_strained["Strain"] = final_clean_strained["Strain"].str.strip()
 
@@ -251,7 +259,7 @@ def load_data_2(verbose=False):
 
     all_levels = [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80]
 
-    start_path = "../liberman_wpz/WPZ Electrophysiology"
+    start_path = _liberman_dir() / "WPZ Electrophysiology"
     for subject in os.listdir(start_path):
         if not os.path.isdir(os.path.join(start_path, subject)):
             continue
@@ -327,7 +335,7 @@ def load_data_2(verbose=False):
                     idx += 1
 
     raw_synapse_counts = pd.read_excel(
-        "../liberman_wpz/WPZ Ribbon and Synapse Counts.xlsx"
+        _liberman_dir() / "WPZ Ribbon and Synapse Counts.xlsx"
     )
     raw_synapse_counts = raw_synapse_counts.mask(lambda x: x.isnull()).dropna()
     raw_synapse_counts["Freq"] = raw_synapse_counts["Freq"] * 1000
@@ -383,7 +391,7 @@ def load_data_2(verbose=False):
     final_clean = final.dropna()
 
     # adding in the strain feature
-    strains = pd.read_excel("../liberman_wpz/WPZ Mouse groups.xlsx")
+    strains = pd.read_excel(_liberman_dir() / "WPZ Mouse groups.xlsx")
     final_clean_strained = final_clean.join(strains.set_index("ID#"), on="Subject")
     final_clean_strained["Strain"] = final_clean_strained["Strain"].str.strip()
     final_clean_strained = final_clean_strained.rename(
