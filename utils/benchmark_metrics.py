@@ -3,14 +3,15 @@ Unified presentation benchmark plots: classical (OLS + RF + XGB long) + NN Stage
 
 Reads cached Parquet exported from ``abr_wide_long_comparison.ipynb``
 (``rows1`` / optional ``rows2``, ``rows6`` for variant-aware classical metrics)
-and ``abr_nn_stage2.ipynb`` (``metrics_all``). See ``presentation_benchmarks.ipynb``.
+and ``abr_nn_stage2.ipynb`` (``metrics_all`` + optional ``stage1_wide_noise_lr_rf_eval.parquet``).
+See ``presentation_benchmarks.ipynb``.
 """
 
 from __future__ import annotations
 
 import warnings
 from pathlib import Path
-from typing import Literal, Mapping, Sequence
+from typing import Literal, Mapping, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,6 +19,14 @@ import pandas as pd
 import seaborn as sns
 
 # ── Canonical model order for unified slide figures ─────────────────────────
+# Margin hints when the **metric is on the vertical axis** (models / categories on x).
+# Label is drawn with rotation=90; use horizontal arrows so after rotation they align with ±y:
+# ← → the plot's vertical axis (Matplotlib rotates CCW).
+# RMSE: lower y is better → ← points down (better), → points up (worse).
+RMSE_Y_AXIS_MARGIN_HINT = r"$\longleftarrow$ better $\mid$ worse $\longrightarrow$"
+# R²: higher y is better → ← points down (worse), → points up (better).
+R2_Y_AXIS_MARGIN_HINT = r"$\longleftarrow$ worse $\mid$ better $\longrightarrow$"
+
 BENCHMARK_DISPLAY_ORDER: list[str] = [
     "LR baseline",
     "LR full",
@@ -63,12 +72,133 @@ VARIANT_PALETTE: dict[str, str] = {
 # NN markers use the same blue as classical **all-long** (explicit hex for scatter).
 NN_ALL_LONG_FACE = VARIANT_PALETTE["all-long"]
 
-# Cache paths (working directory = ``ABR2synapse``)
-CACHE_DIR = Path("figures/cache")
-CLASSICAL_BENCHMARK_PARQUET = CACHE_DIR / "classical_benchmark_long.parquet"
-NN_METRICS_PARQUET = CACHE_DIR / "nn_metrics_all.parquet"
+
+def repo_root() -> Path:
+    """Directory that contains the ``utils`` package (repository / project root)."""
+    return Path(__file__).resolve().parent.parent
+
+
+def resolve_cache_file(name: str) -> Path:
+    """
+    Resolve a single cache filename under ``figures/cache``.
+
+    Checks the canonical root ``<repo>/figures/cache`` first, then
+    ``<repo>/ABR2synapse/figures/cache`` so split exports (e.g. classical/NN only
+    under ``ABR2synapse``) still load when Jupyter cwd is the outer repo root.
+
+    If the file is missing in both locations, returns the path under the
+    canonical directory (for clear ``FileNotFoundError`` messages).
+    """
+    roots = (
+        repo_root() / "figures" / "cache",
+        repo_root() / "ABR2synapse" / "figures" / "cache",
+    )
+    for root in roots:
+        candidate = root / name
+        if candidate.is_file():
+            return candidate
+    return roots[0] / name
+
+
+# Canonical directory for **new** exports (mkdir in notebooks as needed).
+CACHE_DIR = repo_root() / "figures" / "cache"
+
+CLASSICAL_BENCHMARK_PARQUET = resolve_cache_file("classical_benchmark_long.parquet")
+NN_METRICS_PARQUET = resolve_cache_file("nn_metrics_all.parquet")
 BENCHMARK_MERGED_PARQUET = CACHE_DIR / "benchmark_metrics.parquet"
-SEED_RUNS_PARQUET = CACHE_DIR / "benchmark_metrics_by_seed.parquet"
+SEED_RUNS_PARQUET = resolve_cache_file("benchmark_metrics_by_seed.parquet")
+
+# Section 5.3 — synthesis CV + HP artifacts (written by stage2 notebooks / scripts)
+STAGE2_DATA_DIR = CACHE_DIR / "stage2_data"
+STAGE2_BEST_HP_DIR = CACHE_DIR / "stage2_best_hp"
+LIBERMAN_T5_SKLEARN_HP_JSON = STAGE2_BEST_HP_DIR / "liberman_t5_sklearn.json"
+STAGE2_SYNTHESIS_CV_PROGRESS_JSON = CACHE_DIR / "stage2_synthesis_cv_progress.json"
+STAGE2_SYNTHESIS_CV_FOLDS_PARQUET = CACHE_DIR / "stage2_synthesis_cv_folds.parquet"
+STAGE2_SYNTHESIS_CV_SUMMARY_PARQUET = CACHE_DIR / "stage2_synthesis_cv_summary.parquet"
+STAGE2_SYNTHESIS_CV_POOLED_FOLDS_PARQUET = (
+    CACHE_DIR / "stage2_synthesis_cv_pooled_folds.parquet"
+)
+STAGE2_SYNTHESIS_CV_POOLED_PROGRESS_JSON = (
+    CACHE_DIR / "stage2_synthesis_cv_pooled_progress.json"
+)
+STAGE2_SYNTHESIS_CV_OOF_PARQUET = CACHE_DIR / "stage2_synthesis_cv_oof.parquet"
+STAGE2_SYNTHESIS_CV_OOF_PROGRESS_JSON = (
+    CACHE_DIR / "stage2_synthesis_cv_oof_progress.json"
+)
+STAGE2_SYNTHESIS_CV_POOLED_OOF_PARQUET = (
+    CACHE_DIR / "stage2_synthesis_cv_pooled_oof.parquet"
+)
+STAGE2_SYNTHESIS_CV_POOLED_OOF_PROGRESS_JSON = (
+    CACHE_DIR / "stage2_synthesis_cv_pooled_oof_progress.json"
+)
+STAGE2_SYNTHESIS_CV_OOF_R2_SUMMARY_PARQUET = (
+    CACHE_DIR / "stage2_synthesis_cv_oof_r2_summary.parquet"
+)
+STAGE2_SYNTHESIS_STAGE1_TABLE_PARQUET = (
+    CACHE_DIR / "stage2_synthesis_stage1_classification_table.parquet"
+)
+
+
+def stage2_synthesis_cv_paths(
+    n_folds: int,
+) -> tuple[Path, Path, Path]:
+    """
+    Cache paths for synthesis CV keyed by fold count.
+
+    ``n_folds=10`` uses the legacy unsuffixed filenames (existing runs).
+    Other counts use ``stage2_synthesis_cv_{n}fold_*`` under ``figures/cache/``.
+    """
+    if n_folds == 10:
+        return (
+            STAGE2_SYNTHESIS_CV_FOLDS_PARQUET,
+            STAGE2_SYNTHESIS_CV_PROGRESS_JSON,
+            STAGE2_SYNTHESIS_CV_SUMMARY_PARQUET,
+        )
+    tag = f"{n_folds}fold"
+    return (
+        CACHE_DIR / f"stage2_synthesis_cv_{tag}_folds.parquet",
+        CACHE_DIR / f"stage2_synthesis_cv_{tag}_progress.json",
+        CACHE_DIR / f"stage2_synthesis_cv_{tag}_summary.parquet",
+    )
+
+LIBERMAN_GROUP_MEAN_BASELINE_PARQUET = resolve_cache_file(
+    "liberman_group_mean_baseline_metrics.parquet"
+)
+LIBERMAN_SYNAPSE_MEAN_STD_BY_GROUP_FREQ_PARQUET = resolve_cache_file(
+    "liberman_synapse_mean_std_by_group_frequency.parquet"
+)
+BRAD_SYNAPSE_MEAN_STD_BY_GROUP_FREQ_PARQUET = resolve_cache_file(
+    "brad_synapse_mean_std_by_group_frequency.parquet"
+)
+LIBERMAN_GROUP_BASELINE_TEST_BY_GROUP_PARQUET = resolve_cache_file(
+    "liberman_group_baseline_metrics_test_by_group.parquet"
+)
+# Act Ib **O1** — two OLS RMSE marks (Liberman scenario C); written by ``abr_wide_long_comparison.ipynb``.
+O1_OLS_LIBERMAN_TWO_MARKS_PARQUET = resolve_cache_file(
+    "deck_o1_ols_two_marks_liberman.parquet"
+)
+# Act Ib **O2** — three OLS RMSE marks (noise-only predictors; Liberman scenario C).
+O2_OLS_LIBERMAN_THREE_NOISE_PARQUET = resolve_cache_file(
+    "deck_o2_ols_three_noise_marks_liberman.parquet"
+)
+# Act Ib **O3** — four OLS RMSE marks (ladder to shipped linear stack; Liberman scenario C).
+O3_OLS_LIBERMAN_FOUR_STACK_PARQUET = resolve_cache_file(
+    "deck_o3_ols_four_stack_marks_liberman.parquet"
+)
+STAGE1_WIDE_RF_METRICS_JSON = resolve_cache_file("stage1_wide_rf_metrics.json")
+STAGE1_WIDE_LR_RF_EVAL_PARQUET = resolve_cache_file(
+    "stage1_wide_noise_lr_rf_eval.parquet"
+)
+
+
+def apply_benchmark_grid(ax: plt.Axes, *, n_models: int | None = None) -> None:
+    """
+    Public alias for deck notebooks: y-grid plus vertical guides at model indices.
+
+    If ``n_models`` is omitted, uses ``len(BENCHMARK_DISPLAY_ORDER)``.
+    """
+    nm = n_models if n_models is not None else len(BENCHMARK_DISPLAY_ORDER)
+    _apply_benchmark_axes_grids(ax, n_models=nm)
 
 
 def apply_slide_rcparams() -> None:
@@ -511,21 +641,23 @@ def plot_unified_benchmark(
     out_path: Path | str,
     omit_liberman_scenario_a_r2: bool = True,
     yerr_col: str | None = None,
-    figsize: tuple[float, float] = (12.5, 8.4),
+    figsize: tuple[float, float] = (13.8, 7.6),
 ) -> None:
     """
     **2×2** strip plots: rows = Brad / Liberman test; columns = train **B (combined)** /
-    train **matched** (A for Brad, C for Liberman).
+    train **matched** (A for Brad, C for Liberman). **No per-panel titles** (add in slides).
 
     Classical RF/XGB/OLS: multiple **variants** per model (hue): Brad uses **all-long** /
     **all-wide**; Liberman adds **even-long** / **even-wide** when present in the cache.
     NN models use the same **all-long** dot styling as classical (no separate legend entry).
-    Each panel has one rotated margin label: **$R^2$** or **RMSE**, newline, then the
-    worse/better hint (``linespacing`` controls gap). No figure-level suptitle (add in
-    slides). Y-limits are zoomed to the plotted values.
+    Each panel has one rotated left-margin label: **$R^2$** or **RMSE**, newline, then an
+    **arrow** worse/better hint for that metric on **y** (``linespacing`` controls gap).
+    No figure-level suptitle (add in slides). Y-limits are zoomed to the plotted values.
 
     ``omit_liberman_scenario_a_r2``: deprecated (ignored); kept for call compatibility.
     ``yerr_col``: reserved; multi-seed SEM is not drawn on variant strips (merge still in ``df``).
+
+    Saves **PNG** (300 dpi) and **SVG** next to ``out_path`` (same basename; **S3** digests).
     """
     if omit_liberman_scenario_a_r2:
         warnings.warn(
@@ -568,10 +700,7 @@ def plot_unified_benchmark(
     ]
 
     fig, axes = plt.subplots(2, 2, figsize=figsize, sharey=False)
-    better_r2 = r"$\longleftarrow$ worse $\mid$ better $\longrightarrow$"
-    better_rmse = r"$\longleftarrow$ better $\mid$ worse $\longrightarrow$"
-    better_txt = better_r2 if metric == "R2" else better_rmse
-    _fs_title = 14
+    better_txt = R2_Y_AXIS_MARGIN_HINT if metric == "R2" else RMSE_Y_AXIS_MARGIN_HINT
     _fs_tick = 13
     _fs_better = 12
     _fs_leg = 12
@@ -679,7 +808,7 @@ def plot_unified_benchmark(
             metric_annot = r"$R^2$" if metric == "R2" else "RMSE"
             margin_lbl = metric_annot + "\n" + better_txt
             ax.text(
-                -0.18,
+                -0.28,
                 0.5,
                 margin_lbl,
                 transform=ax.transAxes,
@@ -692,13 +821,6 @@ def plot_unified_benchmark(
             )
             ax.tick_params(axis="both", labelsize=_fs_tick)
 
-            if scen == "B":
-                subti = f"{tname} test — train B (combined)"
-            elif tname == "Brad":
-                subti = f"{tname} test — train A (Brad-only)"
-            else:
-                subti = f"{tname} test — train C (Liberman-only)"
-            ax.set_title(subti, fontsize=_fs_title, pad=10)
             ax.set_xticks(range(len(BENCHMARK_DISPLAY_ORDER)))
             ax.set_xticklabels(xtick_labels, rotation=26, ha="right")
             ax.set_xlabel(None)
@@ -719,12 +841,12 @@ def plot_unified_benchmark(
 
     # No figure suptitle — add main title in slide deck. Left margin for rotated labels.
     fig.subplots_adjust(
-        left=0.13,
+        left=0.14,
         right=0.985,
-        top=0.93,
-        bottom=0.18,
-        wspace=0.30,
-        hspace=0.40,
+        top=0.96,
+        bottom=0.16,
+        wspace=0.28,
+        hspace=0.36,
     )
     fig.legend(
         handles=leg_handles,
@@ -734,7 +856,15 @@ def plot_unified_benchmark(
         fontsize=_fs_leg,
         frameon=True,
     )
+    svg_path = out_path.with_suffix(".svg")
     fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.12)
+    fig.savefig(svg_path, bbox_inches="tight", pad_inches=0.12)
+    slug = "r2" if metric == "R2" else "rmse"
+    print(f"=== S3 benchmark_{slug} digest ===")
+    print(f"  n_rows={len(df)}  out_png={out_path.resolve()}  out_svg={svg_path.resolve()}")
+    if col in df.columns:
+        print(f"  metric_column={col}  finite_values={int(df[col].notna().sum())}")
+    print(f"=== end S3 benchmark_{slug} ===")
     plt.close(fig)
 
 
@@ -745,17 +875,21 @@ def plot_stage1_bars(
     labels: tuple[str, str] = ("Brad Buran wide", "Liberman wide"),
 ) -> None:
     """
-    Grouped bars for Stage 1 noise classifier: CV acc, test acc, AUC.
+    Grouped bars for Stage 1 selected model: val row-acc, test animal acc, test AUC.
 
     ``metrics``: e.g.
-    ``{"Brad": (cv_acc, test_acc, auc), "Lib": (...)}``.
+    ``{"Brad": (val_acc_pre, test_acc_post, test_auc_post), "Lib": (...)}`` from
+    ``stage1_wide_metrics.json`` or ``stage1_wide_rf_metrics.json`` shim.
+
+    Saves **PNG** (300 dpi) and **SVG**; digest **S4** when invoked from
+    ``presentation_benchmarks.ipynb``.
     """
     apply_slide_rcparams()
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     labs = list(labels)
-    cats = ["CV acc", "Test acc", "AUC"]
+    cats = ["Val acc (row)", "Test acc (animal, Youden)", "Test AUC (animal)"]
     x = np.arange(len(cats))
     w = 0.35
     br = metrics["Brad"]
@@ -766,14 +900,135 @@ def plot_stage1_bars(
     ax.set_xticks(x)
     ax.set_xticklabels(cats, fontsize=13)
     ax.set_ylabel("Score", fontsize=14)
-    ax.set_title("Stage 1 — wide RF noise classifier (in-domain)", fontsize=15)
     ax.legend(fontsize=12)
     ax.set_ylim(0, 1.05)
     ax.grid(True, axis="y", alpha=0.35)
     sns.despine(ax=ax)
     fig.tight_layout()
+    svg_path = out_path.with_suffix(".svg")
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    fig.savefig(svg_path, bbox_inches="tight")
+    print("=== S4 stage1_wide_rf bars digest ===")
+    print(f"  metrics_keys={list(metrics.keys())}  Brad={metrics.get('Brad')}  Lib={metrics.get('Lib')}")
+    print(f"  out_png={out_path.resolve()}  out_svg={svg_path.resolve()}")
+    print("=== end S4 stage1_wide_rf ===")
     plt.close(fig)
+
+
+def plot_stage1_lr_rf_roc_and_calibration(
+    ev_path: Path | str | None = None,
+    *,
+    out_dir: Path | str | None = None,
+) -> Tuple[Optional[Path], Optional[Path]]:
+    """
+    ROC (2×1: Brad, Liberman) + calibration (2×1) from Appendix D animal-level scores.
+
+    Reads ``stage1_wide_noise_lr_rf_eval.parquet`` (columns ``lab``, ``model``,
+    ``animal_id``, ``y_true``, ``score``). Saves **PNG + SVG** under ``out_dir``
+    (deck policy; no PDF).
+    Returns ``(roc_path, calibration_path)`` or ``(None, None)`` if the eval file is missing.
+    """
+    from sklearn.calibration import calibration_curve
+    from sklearn.metrics import auc, roc_curve
+
+    ev_path = Path(ev_path or STAGE1_WIDE_LR_RF_EVAL_PARQUET)
+    out_dir = Path(out_dir or (repo_root() / "figures" / "presentation"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not ev_path.is_file():
+        return (None, None)
+
+    apply_slide_rcparams()
+    ev = pd.read_parquet(ev_path)
+    labs = ("Brad", "Liberman")
+    colors = {"LR": "#0173B2", "RF": "#DE8F05"}
+
+    fig, axes = plt.subplots(2, 1, figsize=(7.2, 8.2), sharex=True)
+    for ax, lab in zip(axes, labs):
+        sub = ev[ev["lab"].eq(lab)]
+        if sub.empty:
+            ax.text(0.5, 0.5, f"No rows for {lab}", ha="center", transform=ax.transAxes)
+            continue
+        for model in ("LR", "RF"):
+            m = sub[sub["model"].eq(model)]
+            if len(m) < 2:
+                continue
+            y = m["y_true"].to_numpy()
+            s = m["score"].to_numpy()
+            if np.unique(y).size < 2:
+                continue
+            fpr, tpr, _ = roc_curve(y, s)
+            ax.plot(
+                fpr,
+                tpr,
+                label=f"{model} (AUC={auc(fpr, tpr):.3f})",
+                color=colors[model],
+                lw=2.2,
+            )
+        ax.plot([0, 1], [0, 1], ls="--", color="0.55", lw=1)
+        ax.set_ylabel("True positive rate")
+        ax.set_xlim(-0.02, 1.02)
+        ax.set_ylim(-0.02, 1.02)
+        ax.set_aspect("equal", adjustable="box")
+        ax.legend(loc="lower right", fontsize=11)
+        ax.grid(True, alpha=0.35)
+        sns.despine(ax=ax)
+        n_anim = int(sub["animal_id"].nunique())
+        ax.text(0.02, 0.02, f"n={n_anim} test animals", transform=ax.transAxes, fontsize=10)
+    axes[-1].set_xlabel("False positive rate")
+    fig.subplots_adjust(left=0.12, right=0.98, top=0.94, bottom=0.10, hspace=0.32)
+    roc_base = out_dir / "stage1_wide_lr_rf_roc"
+    fig.savefig(roc_base.with_suffix(".png"), dpi=300, bbox_inches="tight", pad_inches=0.12)
+    fig.savefig(roc_base.with_suffix(".svg"), bbox_inches="tight", pad_inches=0.12)
+    print("=== S1 stage1_wide_lr_rf_roc digest ===")
+    print(f"  parquet={ev_path.resolve()}  n_rows={len(ev)}")
+    for lab in labs:
+        sub = ev[ev["lab"].eq(lab)]
+        if sub.empty:
+            print(f"  {lab}: (no rows)")
+        else:
+            na = int(sub["animal_id"].nunique())
+            mods = sorted(sub["model"].dropna().astype(str).unique().tolist())
+            print(f"  {lab}: n_test_animals={na}  models={mods}")
+    print("=== end S1 ===")
+    plt.close(fig)
+
+    fig2, axes2 = plt.subplots(2, 1, figsize=(7.2, 8.2), sharex=True)
+    for ax, lab in zip(axes2, labs):
+        sub = ev[ev["lab"].eq(lab)]
+        ax.plot([0, 1], [0, 1], ls="--", color="0.55", lw=1)
+        for model in ("LR", "RF"):
+            m = sub[sub["model"].eq(model)]
+            if len(m) < 4:
+                continue
+            y = m["y_true"].to_numpy()
+            s = m["score"].to_numpy()
+            if np.unique(y).size < 2:
+                continue
+            try:
+                prob_true, prob_pred = calibration_curve(
+                    y, s, n_bins=min(5, max(3, len(m) // 3)), strategy="uniform"
+                )
+            except ValueError:
+                continue
+            ax.plot(prob_pred, prob_true, marker="o", label=model, color=colors[model], lw=2)
+        ax.set_ylabel("Observed frequency")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_aspect("equal", adjustable="box")
+        ax.legend(loc="upper left", fontsize=10)
+        ax.grid(True, alpha=0.35)
+        sns.despine(ax=ax)
+    axes2[-1].set_xlabel("Mean predicted probability")
+    fig2.subplots_adjust(left=0.12, right=0.98, top=0.94, bottom=0.10, hspace=0.32)
+    cal_base = out_dir / "stage1_wide_lr_rf_calibration"
+    fig2.savefig(cal_base.with_suffix(".png"), dpi=300, bbox_inches="tight", pad_inches=0.12)
+    fig2.savefig(cal_base.with_suffix(".svg"), bbox_inches="tight", pad_inches=0.12)
+    print("=== S2 stage1_wide_lr_rf_calibration digest ===")
+    print(f"  parquet={ev_path.resolve()}  (same eval frame as S1)")
+    print("=== end S2 ===")
+    plt.close(fig2)
+
+    return (roc_base.with_suffix(".png"), cal_base.with_suffix(".png"))
 
 
 MULTI_SEED_DOC = """
