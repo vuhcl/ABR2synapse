@@ -66,6 +66,17 @@ def main() -> int:
     if len(val) == 0:
         errors.append("s1_val empty")
 
+    if data.has_strain:
+        for lst in (data.noise_num_bb, data.noise_num_lib, data.noise_num_common):
+            if "strain_binary" in lst:
+                errors.append("strain_binary must not be in Stage-1 noise features")
+        if "strain_binary" not in data.long_num:
+            errors.append("strain_binary missing from long_num")
+        if not data.reformatted["strain_binary"].eq(0).all():
+            errors.append("Brad strain_binary must be all 0")
+        if not data.orig_lib["strain_binary"].isin([0, 1]).all():
+            errors.append("Liberman strain_binary must be in {0, 1}")
+
     baseline_path = ROOT / "figures/cache/_baseline_probe.json"
     if baseline_path.exists():
         base = json.loads(baseline_path.read_text())
