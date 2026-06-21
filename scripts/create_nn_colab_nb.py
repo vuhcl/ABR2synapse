@@ -24,11 +24,10 @@ cells = [
         "source": src([
             "# ABR NN Stage 2 — Liberman Colab GPU training\n",
             "\n",
-            "Hyperparameter search + final training for three Stage-2 architectures:\n",
+            "Hyperparameter search + final training for Liberman Stage-2 **MLP** (production path for scenario C).\n",
             "\n",
-            "- **MLP** — tabular only (full grid, 72 configs)\n",
-            "- **CNN** — 30-sample Wave I window + tabular\n",
-            "- **CNN full** — full 0–8 ms resampled waveform + tabular\n",
+            "Full **mlp / cnn / cnn_full** comparison with HP grids runs locally in "
+            "[`abr_liberman_synapse_comparison.ipynb`](abr_liberman_synapse_comparison.ipynb).\n",
             "\n",
             "**Prerequisites:** Run the export cell in [`abr_liberman_synapse_comparison.ipynb`](abr_liberman_synapse_comparison.ipynb) locally, then upload `figures/cache/nn_colab_liberman/` to Google Drive (or clone this repo on Colab).\n",
             "\n",
@@ -116,6 +115,26 @@ cells = [
         "cell_type": "code",
         "metadata": {},
         "source": src([
+            "# @title [MLP only] HP search + final training + test evaluation (scenario C)\n",
+            "OUT_DIR = DATA_DIR / \"results\"\n",
+            "mlp_summary = run_mlp_only(DATA_DIR, OUT_DIR, pack=pack, verbose=True)\n",
+            "summary = pd.read_parquet(OUT_DIR / \"nn_colab_summary.parquet\")\n",
+            "display(summary)\n",
+        ]),
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": src([
+            "### Optional: all models (prefer local liberman notebook)\n",
+            "\n",
+            "Full mlp/cnn/cnn_full HP comparison belongs in [`abr_liberman_synapse_comparison.ipynb`](abr_liberman_synapse_comparison.ipynb). Use this cell only if you cannot run that notebook locally.\n",
+        ]),
+    },
+    {
+        "cell_type": "code",
+        "metadata": {},
+        "source": src([
             "# @title [All models] HP search + final training + test evaluation\n",
             "OUT_DIR = DATA_DIR / \"results\"\n",
             "summary = run_all_models(DATA_DIR, OUT_DIR, verbose=True)\n",
@@ -126,16 +145,16 @@ cells = [
         "cell_type": "markdown",
         "metadata": {},
         "source": src([
-            "### MLP only (skip CNN re-runs)\n",
+            "### Re-tune MLP after pack refresh\n",
             "\n",
-            "Run this cell after CNN / `cnn_full` are already in `results/`. It re-tunes and re-trains **MLP only** (72-config grid) and **merges** the new MLP row into `nn_colab_summary.parquet`, leaving CNN artifacts untouched.\n",
+            "Re-runs **MLP only** (72-config grid) and merges into `nn_colab_summary.parquet`, leaving any existing CNN rows untouched.\n",
         ]),
     },
     {
         "cell_type": "code",
         "metadata": {},
         "source": src([
-            "# @title [MLP only] HP search + final training + test evaluation\n",
+            "# @title [MLP only] refresh after strain / feature change\n",
             "OUT_DIR = DATA_DIR / \"results\"\n",
             "mlp_summary = run_mlp_only(DATA_DIR, OUT_DIR, pack=pack, verbose=True)\n",
             "summary = pd.read_parquet(OUT_DIR / \"nn_colab_summary.parquet\")\n",

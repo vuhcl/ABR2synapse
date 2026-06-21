@@ -6,7 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Set, Tuple
+from typing import Any, Dict, List, Literal, Sequence, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -18,6 +18,7 @@ from sklearn.metrics import r2_score
 from sklearn.pipeline import Pipeline
 
 from utils.liberman_classical import (
+    NoiseLabel,
     liberman_feature_lists,
     ols_wide_amp80,
     resolve_amp80_column,
@@ -49,6 +50,7 @@ from utils.subject_cv import (
 EvalCohort = Literal["Brad", "Liberman"]
 TrainScenario = Literal["A", "B", "C"]
 ModelId = Literal["L7", "RF", "XGB", "MLP"]
+SynthesisVariant = Literal["predicted", "true"]
 
 DECK_LABELS: Dict[str, str] = {
     "L7": "LR baseline",
@@ -63,6 +65,24 @@ N_FOLDS = DEFAULT_CEILING_CV_SPLITS
 
 # Bump when fold stratification, ceiling strata, or S1 label universe change.
 SYNTHESIS_CV_CACHE_VERSION = 7
+# Bump when OOF parquet schema / dedupe keys change (invalidates OOF progress only).
+OOF_CACHE_SCHEMA_VERSION = 2
+
+_COHORT_OOF_DEDUPE_KEYS: Tuple[str, ...] = (
+    "eval_cohort",
+    "fold",
+    "train_scenario",
+    "model",
+    "animal_id",
+    "frequency",
+)
+_POOLED_OOF_DEDUPE_KEYS: Tuple[str, ...] = (
+    "fold",
+    "display",
+    "model",
+    "animal_id",
+    "frequency",
+)
 
 
 def _mlp_holdout_seed(eval_cohort: str, scenario: str, fold: int) -> int:
@@ -247,6 +267,66 @@ def stage1_test_metrics_by_cohort(
     return {"Brad": _one(brad_test_animals), "Liberman": _one(liberman_test_animals)}
 
 
+def stage1_pooled_test_metrics(
+    s1_outputs: Union[Dict[str, Any], Sequence[Tuple[Dict[str, Any], Set[str]]]],
+) -> Dict[str, float | int]:
+    """
+    Pooled animal-level test accuracy and ROC AUC on all official holdout mice.
+
+    For combined training pass a single ``s1`` fit dict (one model, one score scale).
+    For within- or cross-cohort rows pass ``[(s1, test_animals), ...]`` so each cohort
+    uses its own model probability and Youden threshold before concatenation.
+
+    For scenarios 1–2, pooled AUROC can fall below per-cohort AUROC when scores from
+    different models are not on a comparable scale across cohorts.
+    """
+    if isinstance(s1_outputs, dict):
+        s1 = s1_outputs
+        y = s1["animal_y_te"]
+        n = int(len(y)) if y is not None else 0
+        return {
+            "overall_test_acc": float(s1["s1_test_acc"]),
+            "overall_test_auc": float(s1["s1_test_auc"]),
+            "overall_n_test": n,
+        }
+
+    ys: List[pd.Series] = []
+    probs: List[pd.Series] = []
+    preds: List[pd.Series] = []
+    for s1, animals in s1_outputs:
+        y = s1["animal_y_te"]
+        prob = s1["animal_prob_te"]
+        if y is None or len(y) == 0:
+            continue
+        animals_set = {str(a) for a in animals}
+        idx = y.index.astype(str).isin(animals_set)
+        if not idx.any():
+            continue
+        yt = y.loc[idx]
+        pr = prob.loc[idx]
+        thr = float(s1["stage1_threshold"])
+        pd_pred = (pr > thr).astype(int)
+        ys.append(yt)
+        probs.append(pr)
+        preds.append(pd_pred)
+
+    if not ys:
+        return {
+            "overall_test_acc": float("nan"),
+            "overall_test_auc": float("nan"),
+            "overall_n_test": 0,
+        }
+
+    y_all = pd.concat(ys)
+    p_all = pd.concat(probs)
+    pred_all = pd.concat(preds)
+    return {
+        "overall_test_acc": _animal_label_accuracy(y_all, pred_all),
+        "overall_test_auc": _animal_auc(y_all, p_all),
+        "overall_n_test": int(len(y_all)),
+    }
+
+
 def fit_global_stage1_for_scenario(
     scenario: TrainScenario,
     data: NNStage2Data,
@@ -310,7 +390,8 @@ def build_stage1_classification_table(
     Stage 1 noise-classifier performance by training scenario and test cohort.
 
     Rows: (1) within-cohort, (2) cross-cohort, (3) combined training.
-    Columns: Brad / Liberman test accuracy and AUC (animal-level @ calibrated threshold).
+    Columns: Brad / Liberman test accuracy and AUC (animal-level @ calibrated threshold),
+    plus pooled overall acc/AUC on all 33 official test animals.
     """
     data = data or load_nn_stage2_data()
     splits = splits or splits_for_long_stage2(data)
@@ -348,6 +429,7 @@ def build_stage1_classification_table(
             if lib_auc is not None
             else by_c["Liberman"]["test_auc"],
             "liberman_n_test": by_c["Liberman"]["n_animals"],
+            **stage1_pooled_test_metrics(s1),
         }
 
     rows: List[Dict[str, Any]] = []
@@ -393,6 +475,9 @@ def build_stage1_classification_table(
             "liberman_test_acc": by_lib["Liberman"]["test_acc"],
             "liberman_test_auc": by_lib["Liberman"]["test_auc"],
             "liberman_n_test": by_lib["Liberman"]["n_animals"],
+            **stage1_pooled_test_metrics(
+                [(s1_bb, brad_test), (s1_lib, lib_test)]
+            ),
         }
     )
 
@@ -435,6 +520,9 @@ def build_stage1_classification_table(
             "liberman_test_acc": by_cross_bb["Liberman"]["test_acc"],
             "liberman_test_auc": by_cross_bb["Liberman"]["test_auc"],
             "liberman_n_test": by_cross_bb["Liberman"]["n_animals"],
+            **stage1_pooled_test_metrics(
+                [(s1_lib_on_bb, brad_test), (s1_bb_on_lib, lib_test)]
+            ),
         }
     )
 
@@ -487,6 +575,29 @@ def _attach_global_stage1(
 attach_global_stage1 = _attach_global_stage1
 
 
+def _synthesis_variant(noise_label: NoiseLabel) -> SynthesisVariant:
+    return "true" if noise_label == "true" else "predicted"
+
+
+def _augment_cv_frames_for_noise(
+    wide_train: pd.DataFrame,
+    wide_eval: pd.DataFrame,
+    long_train: pd.DataFrame,
+    long_eval: pd.DataFrame,
+    animal_preds: pd.Series,
+    *,
+    noise_label: NoiseLabel = "predicted",
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if noise_label == "true":
+        for df in (wide_train, wide_eval, long_train, long_eval):
+            if "noise_cat" not in df.columns:
+                raise ValueError("true-noise synthesis CV requires noise_cat on all frames")
+        return wide_train, wide_eval, long_train, long_eval
+    return _attach_global_stage1(
+        wide_train, wide_eval, long_train, long_eval, animal_preds
+    )
+
+
 def generate_cv_folds(
     wide_df: pd.DataFrame,
     *,
@@ -517,12 +628,16 @@ DISPLAY_TRAIN_SCENARIOS: Dict[int, Dict[str, str]] = {
     2: {"Brad": "C", "Liberman": "A"},
     3: {"Brad": "B", "Liberman": "B"},
 }
-# Pooled summary ``scenario`` column (A/B/C = within / cross / combined pooled).
-POOLED_SCENARIO_BY_DISPLAY: Dict[int, str] = {1: "A", 2: "B", 3: "C"}
+# Pooled summary ``scenario`` column: "1"/"2"/"3" = within / cross / combined (str for parquet).
+POOLED_SCENARIO_BY_DISPLAY: Dict[int, str] = {1: "1", 2: "2", 3: "3"}
 POOLED_DISPLAY_LABELS: Dict[int, str] = {
     1: "Within-cohort",
     2: "Cross-cohort",
     3: "Combined",
+}
+POOLED_SCENARIO_LABELS: Dict[str, str] = {
+    code: POOLED_DISPLAY_LABELS[display]
+    for display, code in POOLED_SCENARIO_BY_DISPLAY.items()
 }
 
 
@@ -534,8 +649,17 @@ def train_scenarios_for_display(display: int) -> Dict[str, str]:
 
 
 def pooled_summary_scenario(display: int) -> str:
-    """Summary ``scenario`` value for Panel C rows."""
+    """Summary ``scenario`` for Panel C rows ("1" within, "2" cross, "3" combined)."""
     return POOLED_SCENARIO_BY_DISPLAY[display]
+
+
+def _coerce_summary_scenario(value: Any) -> str:
+    """Normalize ``scenario`` labels for parquet-safe string columns."""
+    if value == "all" or value is None:
+        return "all"
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    return str(value)
 
 
 def fold_stratum_mean_rmse(
@@ -735,7 +859,9 @@ def _progress_key(
     return f"{eval_cohort}|{fold}|{scenario}|{model}"
 
 
-def _load_progress(path: Path, *, n_splits: int) -> Tuple[Set[str], int]:
+def _load_progress(
+    path: Path, *, n_splits: int, variant: SynthesisVariant = "predicted"
+) -> Tuple[Set[str], int]:
     if not path.is_file():
         return set(), SYNTHESIS_CV_CACHE_VERSION
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -744,16 +870,113 @@ def _load_progress(path: Path, *, n_splits: int) -> Tuple[Set[str], int]:
         return set(), version
     if int(data.get("n_splits", n_splits)) != n_splits:
         return set(), version
+    if data.get("variant", "predicted") != variant:
+        return set(), version
     return set(data.get("completed", [])), version
 
 
-def _save_progress(path: Path, completed: Set[str], *, n_splits: int) -> None:
+def _dedupe_fold_rows(
+    rows: List[Dict[str, Any]], *, keys: Sequence[str]
+) -> List[Dict[str, Any]]:
+    if not rows:
+        return rows
+    df = pd.DataFrame(rows).drop_duplicates(subset=list(keys), keep="last")
+    return df.to_dict("records")
+
+
+def _oof_dedupe_keys(sample: Dict[str, Any]) -> Tuple[str, ...]:
+    if "eval_cohort" in sample:
+        return _COHORT_OOF_DEDUPE_KEYS
+    return _POOLED_OOF_DEDUPE_KEYS
+
+
+def _dedupe_oof_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not rows:
+        return rows
+    keys = _oof_dedupe_keys(rows[0])
+    df = pd.DataFrame(rows).drop_duplicates(subset=list(keys), keep="last")
+    return df.to_dict("records")
+
+
+def _dedupe_oof_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    keys = (
+        _COHORT_OOF_DEDUPE_KEYS
+        if "eval_cohort" in df.columns
+        else _POOLED_OOF_DEDUPE_KEYS
+    )
+    return df.drop_duplicates(subset=list(keys), keep="last").reset_index(drop=True)
+
+
+def _drop_cohort_oof_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    eval_cohort: str,
+    fold: int,
+    train_scenario: str,
+    model: str,
+) -> List[Dict[str, Any]]:
+    return [
+        r
+        for r in rows
+        if not (
+            r.get("eval_cohort") == eval_cohort
+            and int(r.get("fold", -1)) == fold
+            and r.get("train_scenario") == train_scenario
+            and r.get("model") == model
+        )
+    ]
+
+
+def _drop_pooled_oof_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    fold: int,
+    display: int,
+    model: str,
+) -> List[Dict[str, Any]]:
+    return [
+        r
+        for r in rows
+        if not (
+            int(r.get("fold", -1)) == fold
+            and int(r.get("display", -1)) == display
+            and r.get("model") == model
+        )
+    ]
+
+
+def _progress_resume_ok(
+    path: Path, *, n_splits: int, variant: SynthesisVariant = "predicted"
+) -> bool:
+    """True when on-disk progress matches the requested CV run (safe to load fold parquet)."""
+    if not path.is_file():
+        return False
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if int(data.get("version", 1)) != SYNTHESIS_CV_CACHE_VERSION:
+        return False
+    if int(data.get("n_splits", n_splits)) != n_splits:
+        return False
+    if data.get("variant", "predicted") != variant:
+        return False
+    return True
+
+
+def _save_progress(
+    path: Path,
+    completed: Set[str],
+    *,
+    n_splits: int,
+    variant: SynthesisVariant = "predicted",
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
             {
                 "version": SYNTHESIS_CV_CACHE_VERSION,
                 "n_splits": n_splits,
+                "variant": variant,
                 "completed": sorted(completed),
             },
             indent=2,
@@ -834,24 +1057,56 @@ def _append_fold_row(rows: List[Dict[str, Any]], row: Dict[str, Any], out_path: 
     pd.DataFrame(rows).to_parquet(out_path, index=False)
 
 
-def _load_oof_progress(path: Path, *, n_splits: int) -> Set[str]:
+def _load_oof_progress(
+    path: Path, *, n_splits: int, variant: SynthesisVariant = "predicted"
+) -> Set[str]:
     if not path.is_file():
         return set()
     data = json.loads(path.read_text(encoding="utf-8"))
     if int(data.get("version", 1)) != SYNTHESIS_CV_CACHE_VERSION:
         return set()
+    if int(data.get("oof_schema_version", 1)) != OOF_CACHE_SCHEMA_VERSION:
+        return set()
     if int(data.get("n_splits", n_splits)) != n_splits:
+        return set()
+    if data.get("variant", "predicted") != variant:
         return set()
     return set(data.get("completed", []))
 
 
-def _save_oof_progress(path: Path, completed: Set[str], *, n_splits: int) -> None:
+def _oof_progress_resume_ok(
+    path: Path, *, n_splits: int, variant: SynthesisVariant = "predicted"
+) -> bool:
+    """True when on-disk OOF progress matches the requested run (safe to load OOF parquet)."""
+    if not path.is_file():
+        return False
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if int(data.get("version", 1)) != SYNTHESIS_CV_CACHE_VERSION:
+        return False
+    if int(data.get("oof_schema_version", 1)) != OOF_CACHE_SCHEMA_VERSION:
+        return False
+    if int(data.get("n_splits", n_splits)) != n_splits:
+        return False
+    if data.get("variant", "predicted") != variant:
+        return False
+    return True
+
+
+def _save_oof_progress(
+    path: Path,
+    completed: Set[str],
+    *,
+    n_splits: int,
+    variant: SynthesisVariant = "predicted",
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
             {
                 "version": SYNTHESIS_CV_CACHE_VERSION,
+                "oof_schema_version": OOF_CACHE_SCHEMA_VERSION,
                 "n_splits": n_splits,
+                "variant": variant,
                 "completed": sorted(completed),
             },
             indent=2,
@@ -895,7 +1150,9 @@ def _append_oof_records(
     records: List[Dict[str, Any]],
     out_path: Path,
 ) -> None:
-    oof_rows.extend(records)
+    merged = _dedupe_oof_rows(oof_rows + records)
+    oof_rows.clear()
+    oof_rows.extend(merged)
     pd.DataFrame(oof_rows).to_parquet(out_path, index=False)
 
 
@@ -918,6 +1175,7 @@ def _oof_r2_and_ceiling_sem(oof_sub: pd.DataFrame) -> Tuple[float, float]:
 def run_synthesis_cv(
     hp_by_scenario: Dict[str, Dict[str, Any]],
     *,
+    noise_label: NoiseLabel = "predicted",
     data: NNStage2Data | None = None,
     n_splits: int | None = None,
     folds_path: Path | None = None,
@@ -929,32 +1187,43 @@ def run_synthesis_cv(
     force_rerun: bool = False,
     verbose: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    from utils.benchmark_metrics import (
-        STAGE2_SYNTHESIS_CV_OOF_PARQUET,
-        STAGE2_SYNTHESIS_CV_OOF_PROGRESS_JSON,
-        stage2_synthesis_cv_paths,
-    )
+    from utils.benchmark_metrics import synthesis_cv_cache_paths
 
+    variant = _synthesis_variant(noise_label)
     n_splits = int(n_splits or N_FOLDS)
-    default_folds, default_progress, default_summary = stage2_synthesis_cv_paths(n_splits)
+    cache_paths = synthesis_cv_cache_paths(n_splits, variant=variant)
+    (
+        default_folds,
+        default_progress,
+        default_summary,
+        _,
+        _,
+        default_oof,
+        default_oof_progress,
+        _,
+        _,
+        _,
+    ) = cache_paths
 
     data = data or load_nn_stage2_data()
     splits = splits_for_long_stage2(data)
     feats = liberman_feature_lists(data.reformatted_orig, data.common_cols)
     syn_num, syn_log, syn_cat, long_num, long_cat = stage2_feature_lists(
-        feats, noise_label="predicted"
+        feats, noise_label=noise_label
     )
     long_log = list(feats["long_log"])
 
     folds_path = Path(folds_path or default_folds)
     progress_path = Path(progress_path or default_progress)
     summary_path = Path(summary_path or default_summary)
-    oof_path = Path(oof_path or STAGE2_SYNTHESIS_CV_OOF_PARQUET)
-    oof_progress_path = Path(oof_progress_path or STAGE2_SYNTHESIS_CV_OOF_PROGRESS_JSON)
+    oof_path = Path(oof_path or default_oof)
+    oof_progress_path = Path(oof_progress_path or default_oof_progress)
     device = device or resolve_torch_device()
 
     if verbose:
-        print(f"Synthesis CV: {n_splits}-fold → {summary_path.name}")
+        print(
+            f"Synthesis CV ({noise_label}): {n_splits}-fold → {summary_path.name}"
+        )
 
     if force_rerun:
         reset_synthesis_cv_cache(
@@ -965,30 +1234,48 @@ def run_synthesis_cv(
             oof_progress_path=oof_progress_path,
         )
 
-    completed, cache_version = _load_progress(progress_path, n_splits=n_splits)
-    oof_completed = _load_oof_progress(oof_progress_path, n_splits=n_splits)
+    completed, cache_version = _load_progress(
+        progress_path, n_splits=n_splits, variant=variant
+    )
+    oof_completed = _load_oof_progress(
+        oof_progress_path, n_splits=n_splits, variant=variant
+    )
     fold_rows: List[Dict[str, Any]] = []
     oof_rows: List[Dict[str, Any]] = []
-    if folds_path.is_file() and cache_version == SYNTHESIS_CV_CACHE_VERSION:
-        fold_rows = pd.read_parquet(folds_path).to_dict("records")
+    resume_ok = _progress_resume_ok(
+        progress_path, n_splits=n_splits, variant=variant
+    )
+    if folds_path.is_file() and resume_ok:
+        fold_rows = _dedupe_fold_rows(
+            pd.read_parquet(folds_path).to_dict("records"),
+            keys=("eval_cohort", "fold", "train_scenario", "model"),
+        )
     elif folds_path.is_file() and verbose:
         print(
             f"Ignoring stale {folds_path.name} "
-            f"(cache v{cache_version} → v{SYNTHESIS_CV_CACHE_VERSION}); recomputing."
+            f"(n_splits={n_splits}, variant={variant}); recomputing."
         )
-    if oof_path.is_file():
-        oof_rows = pd.read_parquet(oof_path).to_dict("records")
+    if oof_path.is_file() and _oof_progress_resume_ok(
+        oof_progress_path, n_splits=n_splits, variant=variant
+    ):
+        oof_rows = _dedupe_oof_rows(pd.read_parquet(oof_path).to_dict("records"))
+    elif oof_path.is_file() and verbose:
+        print(
+            f"Ignoring stale {oof_path.name} (OOF schema v{OOF_CACHE_SCHEMA_VERSION}); "
+            "rebuilding OOF predictions."
+        )
 
     scenarios: Tuple[TrainScenario, ...] = ("A", "B", "C")
     models: Tuple[ModelId, ...] = ("L7", "RF", "XGB", "MLP")
 
-    if verbose:
-        print("\n=== Global Stage 1 (per training scenario A/B/C) ===")
     global_s1: Dict[TrainScenario, Dict[str, Any]] = {}
-    for scen in scenarios:
-        global_s1[scen] = fit_global_stage1_for_scenario(
-            scen, data, splits, verbose=verbose
-        )
+    if noise_label != "true":
+        if verbose:
+            print("\n=== Global Stage 1 (per training scenario A/B/C) ===")
+        for scen in scenarios:
+            global_s1[scen] = fit_global_stage1_for_scenario(
+                scen, data, splits, verbose=verbose
+            )
 
     for eval_cohort in ("Brad", "Liberman"):
         wide_all = (
@@ -1004,6 +1291,8 @@ def run_synthesis_cv(
             ck = _progress_key(eval_cohort, fold_i, "all", "ceiling")
             need_rmse = ck not in completed
             need_oof = ck not in oof_completed
+            if need_rmse:
+                need_oof = True
             if need_rmse or need_oof:
                 agg_c = _fold_stratum_mean_agg(wide_tr_ceiling, wide_te)
                 if need_rmse:
@@ -1018,10 +1307,19 @@ def run_synthesis_cv(
                     }
                     _append_fold_row(fold_rows, row, folds_path)
                     completed.add(ck)
-                    _save_progress(progress_path, completed, n_splits=n_splits)
+                    _save_progress(
+                        progress_path, completed, n_splits=n_splits, variant=variant
+                    )
                     if verbose:
                         print(f"{eval_cohort} fold {fold_i} ceiling rmse={rmse_c:.4f}")
                 if need_oof:
+                    oof_rows[:] = _drop_cohort_oof_rows(
+                        oof_rows,
+                        eval_cohort=eval_cohort,
+                        fold=fold_i,
+                        train_scenario="all",
+                        model="ceiling",
+                    )
                     _append_oof_records(
                         oof_rows,
                         _agg_to_oof_records(
@@ -1034,15 +1332,25 @@ def run_synthesis_cv(
                         oof_path,
                     )
                     oof_completed.add(ck)
-                    _save_oof_progress(oof_progress_path, oof_completed, n_splits=n_splits)
+                    _save_oof_progress(
+                        oof_progress_path,
+                        oof_completed,
+                        n_splits=n_splits,
+                        variant=variant,
+                    )
 
             for scen in scenarios:
                 w_tr, w_ev, l_tr, l_ev, _, _ = build_cv_scenario_frames(
                     eval_cohort, scen, tr_anim, te_anim, data, splits
                 )
-                gs1 = global_s1[scen]
-                w_aug_tr, w_aug_ev, l_aug_tr, l_aug_ev = _attach_global_stage1(
-                    w_tr, w_ev, l_tr, l_ev, gs1["animal_preds"]
+                gs1 = global_s1.get(scen, {})
+                w_aug_tr, w_aug_ev, l_aug_tr, l_aug_ev = _augment_cv_frames_for_noise(
+                    w_tr,
+                    w_ev,
+                    l_tr,
+                    l_ev,
+                    gs1.get("animal_preds", pd.Series(dtype=float)),
+                    noise_label=noise_label,
                 )
                 hp = hp_by_scenario[scen]
 
@@ -1050,6 +1358,8 @@ def run_synthesis_cv(
                     ck = _progress_key(eval_cohort, fold_i, scen, model)
                     need_rmse = ck not in completed
                     need_oof = ck not in oof_completed
+                    if need_rmse:
+                        need_oof = True
                     if not need_rmse and not need_oof:
                         continue
 
@@ -1104,12 +1414,24 @@ def run_synthesis_cv(
                         }
                         _append_fold_row(fold_rows, row, folds_path)
                         completed.add(ck)
-                        _save_progress(progress_path, completed, n_splits=n_splits)
+                        _save_progress(
+                            progress_path,
+                            completed,
+                            n_splits=n_splits,
+                            variant=variant,
+                        )
                         if verbose:
                             print(
                                 f"{eval_cohort} f{fold_i} scen={scen} {model} rmse={rmse:.4f}"
                             )
                     if need_oof:
+                        oof_rows[:] = _drop_cohort_oof_rows(
+                            oof_rows,
+                            eval_cohort=eval_cohort,
+                            fold=fold_i,
+                            train_scenario=scen,
+                            model=model,
+                        )
                         _append_oof_records(
                             oof_rows,
                             _agg_to_oof_records(
@@ -1122,7 +1444,12 @@ def run_synthesis_cv(
                             oof_path,
                         )
                         oof_completed.add(ck)
-                        _save_oof_progress(oof_progress_path, oof_completed, n_splits=n_splits)
+                        _save_oof_progress(
+                            oof_progress_path,
+                            oof_completed,
+                            n_splits=n_splits,
+                            variant=variant,
+                        )
 
     folds_df = pd.DataFrame(fold_rows)
     summary = summarize_cv_folds(folds_df)
@@ -1194,7 +1521,9 @@ def _pooled_ceiling_key(fold: int) -> str:
     return f"{fold}|ceiling"
 
 
-def _load_pooled_progress(path: Path, *, n_splits: int) -> Set[str]:
+def _load_pooled_progress(
+    path: Path, *, n_splits: int, variant: SynthesisVariant = "predicted"
+) -> Set[str]:
     if not path.is_file():
         return set()
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -1202,16 +1531,25 @@ def _load_pooled_progress(path: Path, *, n_splits: int) -> Set[str]:
         return set()
     if int(data.get("n_splits", n_splits)) != n_splits:
         return set()
+    if data.get("variant", "predicted") != variant:
+        return set()
     return set(data.get("completed", []))
 
 
-def _save_pooled_progress(path: Path, completed: Set[str], *, n_splits: int) -> None:
+def _save_pooled_progress(
+    path: Path,
+    completed: Set[str],
+    *,
+    n_splits: int,
+    variant: SynthesisVariant = "predicted",
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
             {
                 "version": SYNTHESIS_CV_CACHE_VERSION,
                 "n_splits": n_splits,
+                "variant": variant,
                 "completed": sorted(completed),
             },
             indent=2,
@@ -1253,6 +1591,7 @@ def _append_pooled_row(rows: List[Dict[str, Any]], row: Dict[str, Any], out_path
 def compute_pooled_synthesis_folds(
     hp_by_scenario: Dict[str, Dict[str, Any]],
     *,
+    noise_label: NoiseLabel = "predicted",
     data: NNStage2Data | None = None,
     n_splits: int | None = None,
     folds_path: Path | None = None,
@@ -1267,22 +1606,28 @@ def compute_pooled_synthesis_folds(
     Per-fold RMSE pooling Brad + Liberman holdout animal×frequency predictions.
 
   Display buckets 1–3 map to cohort-specific train scenarios; summary uses
-    ``scenario`` A/B/C = within / cross / combined pooled.
+    ``scenario`` 1/2/3 = within / cross / combined pooled.
     """
-    from utils.benchmark_metrics import (
-        STAGE2_SYNTHESIS_CV_POOLED_FOLDS_PARQUET,
-        STAGE2_SYNTHESIS_CV_POOLED_OOF_PARQUET,
-        STAGE2_SYNTHESIS_CV_POOLED_OOF_PROGRESS_JSON,
-        STAGE2_SYNTHESIS_CV_POOLED_PROGRESS_JSON,
-    )
+    from utils.benchmark_metrics import synthesis_cv_cache_paths
 
+    variant = _synthesis_variant(noise_label)
     n_splits = int(n_splits or N_FOLDS)
-    folds_path = Path(folds_path or STAGE2_SYNTHESIS_CV_POOLED_FOLDS_PARQUET)
-    progress_path = Path(progress_path or STAGE2_SYNTHESIS_CV_POOLED_PROGRESS_JSON)
-    oof_path = Path(oof_path or STAGE2_SYNTHESIS_CV_POOLED_OOF_PARQUET)
-    oof_progress_path = Path(
-        oof_progress_path or STAGE2_SYNTHESIS_CV_POOLED_OOF_PROGRESS_JSON
-    )
+    (
+        _,
+        _,
+        _,
+        default_folds,
+        default_progress,
+        _,
+        _,
+        default_oof,
+        default_oof_progress,
+        _,
+    ) = synthesis_cv_cache_paths(n_splits, variant=variant)
+    folds_path = Path(folds_path or default_folds)
+    progress_path = Path(progress_path or default_progress)
+    oof_path = Path(oof_path or default_oof)
+    oof_progress_path = Path(oof_progress_path or default_oof_progress)
     device = device or resolve_torch_device()
 
     if force_rerun:
@@ -1293,20 +1638,42 @@ def compute_pooled_synthesis_folds(
             oof_progress_path=oof_progress_path,
         )
 
-    completed = _load_pooled_progress(progress_path, n_splits=n_splits)
-    oof_completed = _load_oof_progress(oof_progress_path, n_splits=n_splits)
+    completed = _load_pooled_progress(
+        progress_path, n_splits=n_splits, variant=variant
+    )
+    oof_completed = _load_oof_progress(
+        oof_progress_path, n_splits=n_splits, variant=variant
+    )
     fold_rows: List[Dict[str, Any]] = []
     oof_rows: List[Dict[str, Any]] = []
-    if folds_path.is_file() and not force_rerun:
-        fold_rows = pd.read_parquet(folds_path).to_dict("records")
-    if oof_path.is_file() and not force_rerun:
-        oof_rows = pd.read_parquet(oof_path).to_dict("records")
+    resume_ok = _progress_resume_ok(
+        progress_path, n_splits=n_splits, variant=variant
+    )
+    if folds_path.is_file() and not force_rerun and resume_ok:
+        fold_rows = _dedupe_fold_rows(
+            pd.read_parquet(folds_path).to_dict("records"),
+            keys=("fold", "display", "model"),
+        )
+    elif folds_path.is_file() and not force_rerun and verbose:
+        print(
+            f"Ignoring stale {folds_path.name} "
+            f"(n_splits={n_splits}, variant={variant}); recomputing."
+        )
+    if oof_path.is_file() and not force_rerun and _oof_progress_resume_ok(
+        oof_progress_path, n_splits=n_splits, variant=variant
+    ):
+        oof_rows = _dedupe_oof_rows(pd.read_parquet(oof_path).to_dict("records"))
+    elif oof_path.is_file() and not force_rerun and verbose:
+        print(
+            f"Ignoring stale {oof_path.name} (OOF schema v{OOF_CACHE_SCHEMA_VERSION}); "
+            "rebuilding pooled OOF predictions."
+        )
 
     data = data or load_nn_stage2_data()
     splits = splits_for_long_stage2(data)
     feats = liberman_feature_lists(data.reformatted_orig, data.common_cols)
     syn_num, syn_log, syn_cat, long_num, long_cat = stage2_feature_lists(
-        feats, noise_label="predicted"
+        feats, noise_label=noise_label
     )
     long_log = list(feats["long_log"])
 
@@ -1314,13 +1681,16 @@ def compute_pooled_synthesis_folds(
     models: Tuple[ModelId, ...] = ("L7", "RF", "XGB", "MLP")
 
     if verbose:
-        print(f"Pooled synthesis CV: {n_splits}-fold → {folds_path.name}")
+        print(
+            f"Pooled synthesis CV ({noise_label}): {n_splits}-fold → {folds_path.name}"
+        )
 
     global_s1: Dict[TrainScenario, Dict[str, Any]] = {}
-    for scen in scenarios:
-        global_s1[scen] = fit_global_stage1_for_scenario(
-            scen, data, splits, verbose=False
-        )
+    if noise_label != "true":
+        for scen in scenarios:
+            global_s1[scen] = fit_global_stage1_for_scenario(
+                scen, data, splits, verbose=False
+            )
 
     bb_wide = data.reformatted.reset_index(drop=True)
     lib_wide = data.reformatted_orig.reset_index(drop=True)
@@ -1338,6 +1708,8 @@ def compute_pooled_synthesis_folds(
         ck_ceil = _pooled_ceiling_key(fold_i)
         need_rmse = ck_ceil not in completed
         need_oof = ck_ceil not in oof_completed
+        if need_rmse:
+            need_oof = True
         if need_rmse or need_oof:
             wide_tr_pool = pd.concat([wide_tr_bb, wide_tr_lib], ignore_index=True)
             wide_te_pool = pd.concat([wide_te_bb, wide_te_lib], ignore_index=True)
@@ -1357,10 +1729,18 @@ def compute_pooled_synthesis_folds(
                     folds_path,
                 )
                 completed.add(ck_ceil)
-                _save_pooled_progress(progress_path, completed, n_splits=n_splits)
+                _save_pooled_progress(
+                    progress_path, completed, n_splits=n_splits, variant=variant
+                )
                 if verbose:
                     print(f"pooled fold {fold_i} ceiling rmse={rmse_c:.4f}")
             if need_oof:
+                oof_rows[:] = _drop_pooled_oof_rows(
+                    oof_rows,
+                    fold=fold_i,
+                    display=0,
+                    model="ceiling",
+                )
                 _append_oof_records(
                     oof_rows,
                     _agg_to_oof_records(
@@ -1372,7 +1752,12 @@ def compute_pooled_synthesis_folds(
                     oof_path,
                 )
                 oof_completed.add(ck_ceil)
-                _save_oof_progress(oof_progress_path, oof_completed, n_splits=n_splits)
+                _save_oof_progress(
+                    oof_progress_path,
+                    oof_completed,
+                    n_splits=n_splits,
+                    variant=variant,
+                )
 
         for display in (1, 2, 3):
             scen_map = train_scenarios_for_display(display)
@@ -1380,6 +1765,8 @@ def compute_pooled_synthesis_folds(
                 ck = _pooled_progress_key(fold_i, display, model)
                 need_rmse = ck not in completed
                 need_oof = ck not in oof_completed
+                if need_rmse:
+                    need_oof = True
                 if not need_rmse and not need_oof:
                     continue
 
@@ -1391,9 +1778,14 @@ def compute_pooled_synthesis_folds(
                     w_tr, w_ev, l_tr, l_ev, _, _ = build_cv_scenario_frames(
                         eval_cohort, scen, tr_anim, te_anim, data, splits  # type: ignore[arg-type]
                     )
-                    gs1 = global_s1[scen]
-                    w_aug_tr, w_aug_ev, l_aug_tr, l_aug_ev = _attach_global_stage1(
-                        w_tr, w_ev, l_tr, l_ev, gs1["animal_preds"]
+                    gs1 = global_s1.get(scen, {})
+                    w_aug_tr, w_aug_ev, l_aug_tr, l_aug_ev = _augment_cv_frames_for_noise(
+                        w_tr,
+                        w_ev,
+                        l_tr,
+                        l_ev,
+                        gs1.get("animal_preds", pd.Series(dtype=float)),
+                        noise_label=noise_label,
                     )
                     hp = hp_by_scenario[scen]
 
@@ -1452,12 +1844,20 @@ def compute_pooled_synthesis_folds(
                         folds_path,
                     )
                     completed.add(ck)
-                    _save_pooled_progress(progress_path, completed, n_splits=n_splits)
+                    _save_pooled_progress(
+                        progress_path, completed, n_splits=n_splits, variant=variant
+                    )
                     if verbose:
                         print(
                             f"pooled f{fold_i} display={display} {model} rmse={rmse:.4f}"
                         )
                 if need_oof:
+                    oof_rows[:] = _drop_pooled_oof_rows(
+                        oof_rows,
+                        fold=fold_i,
+                        display=display,
+                        model=model,
+                    )
                     _append_oof_records(
                         oof_rows,
                         _agg_to_oof_records(
@@ -1469,28 +1869,39 @@ def compute_pooled_synthesis_folds(
                         oof_path,
                     )
                     oof_completed.add(ck)
-                    _save_oof_progress(oof_progress_path, oof_completed, n_splits=n_splits)
+                    _save_oof_progress(
+                        oof_progress_path,
+                        oof_completed,
+                        n_splits=n_splits,
+                        variant=variant,
+                    )
 
     return pd.DataFrame(fold_rows)
 
 
 def summarize_pooled_folds(folds_df: pd.DataFrame) -> pd.DataFrame:
     """Aggregate pooled fold RMSE → deck rows with ``test_set='Pooled'``."""
+
+    def _fold_rmse(sub: pd.DataFrame) -> pd.Series:
+        if sub.empty:
+            return pd.Series(dtype=float)
+        return sub.groupby("fold", sort=True)["rmse"].mean()
+
     recs: List[Dict[str, Any]] = []
     ceil = folds_df.loc[folds_df["model"].eq("ceiling")]
-    if len(ceil):
-        sub = ceil["rmse"]
+    fold_rmse_c = _fold_rmse(ceil)
+    if len(fold_rmse_c):
         recs.append(
             {
                 "test_set": "Pooled",
                 "scenario": "all",
                 "model": "ceiling",
-                "RMSE": float(sub.mean()),
-                "RMSE_sem": float(sub.std(ddof=1) / np.sqrt(len(sub)))
-                if len(sub) > 1
+                "RMSE": float(fold_rmse_c.mean()),
+                "RMSE_sem": float(fold_rmse_c.std(ddof=1) / np.sqrt(len(fold_rmse_c)))
+                if len(fold_rmse_c) > 1
                 else 0.0,
                 "source": "ceiling",
-                "n_folds": int(len(sub)),
+                "n_folds": int(fold_rmse_c.index.nunique()),
             }
         )
 
@@ -1498,30 +1909,30 @@ def summarize_pooled_folds(folds_df: pd.DataFrame) -> pd.DataFrame:
     for display in (1, 2, 3):
         scen_col = pooled_summary_scenario(display)
         for model in models:
-            sub = folds_df.loc[
-                folds_df["display"].eq(display) & folds_df["model"].eq(model),
-                "rmse",
+            sub_df = folds_df.loc[
+                folds_df["display"].eq(display) & folds_df["model"].eq(model)
             ]
-            if sub.empty:
+            fold_rmse = _fold_rmse(sub_df)
+            if fold_rmse.empty:
                 continue
-            src = folds_df.loc[
-                folds_df["display"].eq(display) & folds_df["model"].eq(model),
-                "source",
-            ].iloc[0]
+            src = sub_df["source"].iloc[0]
             recs.append(
                 {
                     "test_set": "Pooled",
                     "scenario": scen_col,
                     "model": DECK_LABELS[model],
-                    "RMSE": float(sub.mean()),
-                    "RMSE_sem": float(sub.std(ddof=1) / np.sqrt(len(sub)))
-                    if len(sub) > 1
+                    "RMSE": float(fold_rmse.mean()),
+                    "RMSE_sem": float(fold_rmse.std(ddof=1) / np.sqrt(len(fold_rmse)))
+                    if len(fold_rmse) > 1
                     else 0.0,
                     "source": src,
-                    "n_folds": int(len(sub)),
+                    "n_folds": int(fold_rmse.index.nunique()),
                 }
             )
-    return pd.DataFrame(recs)
+    out = pd.DataFrame(recs)
+    if not out.empty:
+        out["scenario"] = out["scenario"].map(_coerce_summary_scenario)
+    return out
 
 
 _PANEL_C_MODELS: Tuple[str, ...] = (
@@ -1535,17 +1946,15 @@ _PANEL_C_MODELS: Tuple[str, ...] = (
 def panel_c_rmse_report_table(summary_pooled: pd.DataFrame) -> pd.DataFrame:
     """Readable Panel C table: models × within/cross/combined (+ ceiling)."""
     models = list(_PANEL_C_MODELS)
-    cols = {
-        "A": "Within-cohort",
-        "B": "Cross-cohort",
-        "C": "Combined",
-    }
+    cols = dict(POOLED_SCENARIO_LABELS)
     rows: List[Dict[str, Any]] = []
     sub = summary_pooled.loc[summary_pooled["test_set"].eq("Pooled")]
     for model in models:
         row: Dict[str, Any] = {"model": model}
         for scen, label in cols.items():
-            r = sub.loc[sub["scenario"].eq(scen) & sub["model"].eq(model)]
+            r = sub.loc[
+                sub["scenario"].astype(str).eq(str(scen)) & sub["model"].eq(model)
+            ]
             if r.empty:
                 row[label] = ""
             else:
@@ -1570,6 +1979,7 @@ def panel_c_rmse_report_table(summary_pooled: pd.DataFrame) -> pd.DataFrame:
 
 def summarize_cohort_oof_r2(cohort_oof: pd.DataFrame) -> pd.DataFrame:
     """Liberman/Brad pooled OOF R² summary rows (``test_set`` = eval cohort)."""
+    cohort_oof = _dedupe_oof_df(cohort_oof)
     recs: List[Dict[str, Any]] = []
     ceil = cohort_oof.loc[cohort_oof["model"].eq("ceiling")]
     for eval_cohort in ("Brad", "Liberman"):
@@ -1620,6 +2030,7 @@ def summarize_cohort_oof_r2(cohort_oof: pd.DataFrame) -> pd.DataFrame:
 
 def summarize_pooled_panel_oof_r2(pooled_oof: pd.DataFrame) -> pd.DataFrame:
     """Panel C rows with ``test_set='Pooled'`` from pooled-synthesis OOF cache."""
+    pooled_oof = _dedupe_oof_df(pooled_oof)
     recs: List[Dict[str, Any]] = []
     ceil = pooled_oof.loc[pooled_oof["model"].eq("ceiling")]
     if not ceil.empty:
@@ -1660,7 +2071,10 @@ def summarize_pooled_panel_oof_r2(pooled_oof: pd.DataFrame) -> pd.DataFrame:
                     "n_folds": int(sub["fold"].nunique()),
                 }
             )
-    return pd.DataFrame(recs)
+    out = pd.DataFrame(recs)
+    if not out.empty:
+        out["scenario"] = out["scenario"].map(_coerce_summary_scenario)
+    return out
 
 
 def summarize_pooled_oof_r2(
@@ -1676,7 +2090,7 @@ def summarize_pooled_oof_r2(
 
 def pooled_oof_r2_report_table(r2_summary: pd.DataFrame) -> pd.DataFrame:
     """§5.2.2 table: models × scenario with Cohort A / B / Pooled columns."""
-    scen_labels = {
+    cohort_scen_labels = {
         "A": "Within-cohort",
         "B": "Cross-cohort",
         "C": "Combined",
@@ -1695,7 +2109,11 @@ def pooled_oof_r2_report_table(r2_summary: pd.DataFrame) -> pd.DataFrame:
                 r2_summary["test_set"].eq(test_set) & r2_summary["model"].eq(model)
             ]
             parts: List[str] = []
-            for scen, label in scen_labels.items():
+            if test_set == "Pooled":
+                scen_items = POOLED_SCENARIO_LABELS.items()
+            else:
+                scen_items = cohort_scen_labels.items()
+            for scen, label in scen_items:
                 r = sub.loc[sub["scenario"].eq(scen)]
                 if r.empty:
                     continue

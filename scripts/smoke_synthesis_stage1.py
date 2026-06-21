@@ -1,4 +1,13 @@
 """Smoke: global Stage-1 labels + fold attach (Brad + Liberman, A/B/C)."""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from utils.nn_stage2_data import load_nn_stage2_data, splits_for_long_stage2
 from utils.stage2_synthesis_cv import (
     _attach_global_stage1,
@@ -8,6 +17,12 @@ from utils.stage2_synthesis_cv import (
 )
 
 data = load_nn_stage2_data()
+assert data.has_strain, "expected strain on both cohorts"
+assert "strain_binary" not in data.noise_num_bb
+assert "strain_binary" not in data.noise_num_lib
+assert "strain_binary" in data.long_num
+assert data.reformatted["strain_binary"].eq(0).all()
+
 splits = splits_for_long_stage2(data)
 for cohort, wide in (
     ("Brad", data.reformatted.reset_index(drop=True)),

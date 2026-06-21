@@ -529,29 +529,6 @@ def run_one_model(
     return row
 
 
-def run_mlp_only(
-    data_dir: Path | str,
-    out_dir: Path | str | None = None,
-    pack: dict[str, Any] | None = None,
-    *,
-    verbose: bool = True,
-) -> pd.DataFrame:
-    """Re-run MLP only; merge into ``nn_colab_summary`` (keeps existing CNN rows)."""
-    data_dir = Path(data_dir)
-    out_dir = Path(out_dir or data_dir / "results")
-    pack = pack if pack is not None else load_colab_pack(data_dir)
-    row = run_one_model(
-        pack,
-        out_dir,
-        "mlp",
-        "mlp",
-        tune_mlp,
-        train_final_mlp,
-        verbose=verbose,
-    )
-    return _save_summary(out_dir, row, merge_models=("mlp",))
-
-
 def run_all_models(
     data_dir: Path | str,
     out_dir: Path | str | None = None,
@@ -594,3 +571,70 @@ def run_all_models(
         summary.to_json(orient="records", indent=2)
     )
     return summary
+
+
+NN_COMPARISON_IDS = {"mlp": "N1", "cnn": "N2", "cnn_full": "N3"}
+
+
+def hp_summary_to_comparison_rows(
+    summary: pd.DataFrame,
+    *,
+    noise_label: str | None = None,
+) -> pd.DataFrame:
+    """Map ``run_all_models`` summary to Liberman comparison panel schema."""
+    rows: list[dict[str, Any]] = []
+    nl = noise_label or "predicted"
+    for _, r in summary.iterrows():
+        model = str(r["model"])
+        rows.append(
+            {
+                "config_id": NN_COMPARISON_IDS.get(model, model),
+                "model": model,
+                "format": "long",
+                "noise_label": nl,
+                "r2_test": float(r["r2_test"]),
+                "rmse_test": float(r["rmse_test"]),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def run_liberman_nn_hp_comparison(
+    data_dir: Path | str,
+    out_dir: Path | str | None = None,
+    *,
+    verbose: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    HP-tune mlp / cnn / cnn_full on an exported Colab pack.
+
+    Returns (full summary with HP columns, comparison rows for the classical panel).
+    """
+    data_dir = Path(data_dir)
+    manifest = json.loads((data_dir / "manifest.json").read_text())
+    summary = run_all_models(data_dir, out_dir, verbose=verbose)
+    nl = str(manifest.get("noise_label", "predicted"))
+    return summary, hp_summary_to_comparison_rows(summary, noise_label=nl)
+
+
+def run_mlp_only(
+    data_dir: Path | str,
+    out_dir: Path | str | None = None,
+    pack: dict[str, Any] | None = None,
+    *,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """Re-run MLP only; merge into ``nn_colab_summary`` (keeps existing CNN rows)."""
+    data_dir = Path(data_dir)
+    out_dir = Path(out_dir or data_dir / "results")
+    pack = pack if pack is not None else load_colab_pack(data_dir)
+    row = run_one_model(
+        pack,
+        out_dir,
+        "mlp",
+        "mlp",
+        tune_mlp,
+        train_final_mlp,
+        verbose=verbose,
+    )
+    return _save_summary(out_dir, row, merge_models=("mlp",))

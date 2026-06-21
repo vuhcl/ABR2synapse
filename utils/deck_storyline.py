@@ -28,11 +28,12 @@ from utils.benchmark_metrics import (
     apply_slide_rcparams,
     repo_root,
 )
+from utils.abr_univariate_eda import NOISE_LABELS
 
 # Act I ribbons + Figure 2 ROC palette
 _NOISE_LOWER_COLOR = "#0173B2"
 _NOISE_HIGHER_COLOR = "#DE8F05"
-_RIBBON_LEGEND_LABELS = ("Lower noise", "Higher noise")
+_RIBBON_LEGEND_LABELS = (NOISE_LABELS[0], NOISE_LABELS[1])
 _DECK_AXIS_LABEL_FS = 13
 _DECK_TICK_FS = 11
 _DECK_LEGEND_FS = 13
@@ -44,6 +45,10 @@ _RIBBON_MARKER_SIZE = 8.5
 # Brad Hz→kHz rounding can land on 5.7 / 45.3; align to test-grid kHz labels.
 _BRAD_FREQ_KHZ_ALIAS: dict[float, float] = {5.7: 5.6, 45.3: 45.2}
 _COHORT_RIBBONS_DPI = 450
+_LIBERMAN_STRAIN_RIBBON_PANELS = (
+    ("C57BL/6J", 1),  # panel A
+    ("CBA/CaJ", 0),  # panel B
+)
 
 try:
     from IPython.display import display
@@ -342,6 +347,25 @@ def _plot_synapse_ribbons_panel(
     sns.despine(ax=ax)
 
 
+def _liberman_synapse_ribbons_for_strain(
+    wide: pd.DataFrame, strain_binary: int
+) -> pd.DataFrame:
+    sub = wide.loc[wide["strain_binary"].eq(strain_binary)]
+    return _canonicalize_ribbon_frequencies(
+        _synapse_mean_std_by_group_frequency(sub)
+    )
+
+
+def _act1_cohort_ribbons_ylim() -> tuple[float, float] | None:
+    """Y limits for Act I cohort + Liberman-strain ribbon figures (Liberman | Brad)."""
+    lib_path = LIBERMAN_SYNAPSE_MEAN_STD_BY_GROUP_FREQ_PARQUET
+    if not lib_path.is_file():
+        return None
+    gf_lib = pd.read_parquet(lib_path)
+    gf_brad = ensure_brad_synapse_mean_std_by_group_frequency()
+    return _ribbon_ylim(pd.concat([gf_lib, gf_brad], ignore_index=True))
+
+
 def deck_act1_synapse_ribbons_cohorts() -> None:
     """Act I — 1×2 synapse ribbons (Cohort A Liberman | Cohort B Brad), by noise group."""
     lib_path = LIBERMAN_SYNAPSE_MEAN_STD_BY_GROUP_FREQ_PARQUET
@@ -363,9 +387,7 @@ def deck_act1_synapse_ribbons_cohorts() -> None:
     g_to_color = _noise_group_colors(groups)
     g_to_off = _noise_group_offsets(groups)
 
-    y0, y1 = _ribbon_ylim(
-        pd.concat([gf_lib, gf_brad], ignore_index=True),
-    )
+    y0, y1 = _ribbon_ylim(pd.concat([gf_lib, gf_brad], ignore_index=True))
 
     fig = plt.figure(figsize=(10, 6))
     gs = fig.add_gridspec(
@@ -437,6 +459,118 @@ def deck_act1_synapse_ribbons_cohorts() -> None:
     _deck_footer(fig, "")
     _save_deck_png_svg(
         fig, "deck_act1_synapse_ribbons_cohorts", dpi=_COHORT_RIBBONS_DPI
+    )
+
+
+def deck_act1_synapse_ribbons_liberman_strains() -> None:
+    """Act I — 1×2 synapse ribbons (Liberman C57BL/6J | CBA/CaJ), by noise group."""
+    from utils.nn_stage2_data import load_nn_stage2_data
+
+    apply_slide_rcparams()
+    wide = load_nn_stage2_data().reformatted_orig
+    if "strain_binary" not in wide.columns:
+        print(
+            "Skip Act I Liberman strain ribbons — wide table missing strain_binary "
+            "(check load_data / WPZ Mouse groups.xlsx)."
+        )
+        return
+
+    for label, sb in _LIBERMAN_STRAIN_RIBBON_PANELS:
+        n = int(wide.loc[wide["strain_binary"].eq(sb)].shape[0])
+        print(f"Liberman strain ribbons — {label} (strain_binary={sb}): {n} wide rows")
+
+    gf_c57 = _liberman_synapse_ribbons_for_strain(wide, 1)
+    gf_cba = _liberman_synapse_ribbons_for_strain(wide, 0)
+    if gf_c57.empty or gf_cba.empty:
+        print(
+            "Skip Act I Liberman strain ribbons — empty stratum table for one or both strains."
+        )
+        return
+
+    gf_all = pd.concat([gf_c57, gf_cba], ignore_index=True)
+    groups = sorted(gf_all["Group"].astype(str).unique(), key=lambda x: float(x))
+    g_to_color = _noise_group_colors(groups)
+    g_to_off = _noise_group_offsets(groups)
+    ylim = _act1_cohort_ribbons_ylim()
+    if ylim is None:
+        print(
+            "Skip Act I Liberman strain ribbons — missing",
+            LIBERMAN_SYNAPSE_MEAN_STD_BY_GROUP_FREQ_PARQUET.resolve(),
+            "(run liberman_synapses_group_baseline.ipynb export; needed for y-axis match).",
+        )
+        return
+    y0, y1 = ylim
+
+    fig = plt.figure(figsize=(10, 6))
+    gs = fig.add_gridspec(
+        2,
+        2,
+        height_ratios=[0.16, 1.0],
+        width_ratios=[1, 1],
+        wspace=0.12,
+        hspace=0.10,
+    )
+    ax_leg = fig.add_subplot(gs[0, :])
+    ax_leg.set_axis_off()
+    ax_leg.legend(
+        handles=[
+            Line2D(
+                [0],
+                [0],
+                color=_NOISE_LOWER_COLOR,
+                marker="o",
+                linestyle="None",
+                markersize=8,
+                label=_RIBBON_LEGEND_LABELS[0],
+            ),
+            Line2D(
+                [0],
+                [0],
+                color=_NOISE_HIGHER_COLOR,
+                marker="o",
+                linestyle="None",
+                markersize=8,
+                label=_RIBBON_LEGEND_LABELS[1],
+            ),
+        ],
+        ncol=2,
+        loc="center",
+        bbox_to_anchor=(0.5, 0.85),
+        frameon=True,
+        fancybox=False,
+        edgecolor="0.82",
+        facecolor="white",
+        framealpha=1.0,
+        fontsize=_DECK_LEGEND_FS,
+    )
+
+    ax_a = fig.add_subplot(gs[1, 0])
+    ax_b = fig.add_subplot(gs[1, 1], sharey=ax_a)
+    _plot_synapse_ribbons_panel(
+        ax_a, gf_c57, g_to_color=g_to_color, g_to_off=g_to_off
+    )
+    _plot_synapse_ribbons_panel(
+        ax_b, gf_cba, g_to_color=g_to_color, g_to_off=g_to_off
+    )
+
+    for ax in (ax_a, ax_b):
+        ax.set_ylim(y0, y1)
+
+    ax_a.set_ylabel(
+        "Synapses / Inner Hair Cell (IHC)", fontsize=_DECK_AXIS_LABEL_FS
+    )
+    ax_a.tick_params(axis="both", labelsize=_DECK_TICK_FS)
+    ax_b.tick_params(axis="x", labelsize=_DECK_TICK_FS)
+    ax_b.tick_params(axis="y", left=False, labelleft=False)
+    plt.setp(ax_b.get_yticklabels(), visible=False)
+
+    fig.subplots_adjust(left=0.10, right=0.98, top=0.88, bottom=0.22)
+    fig.supxlabel("Frequency (kHz)", fontsize=_DECK_AXIS_LABEL_FS, y=0.08)
+    _deck_panel_letter(fig, ax_a, "A")
+    _deck_panel_letter(fig, ax_b, "B")
+    _deck_footer(fig, "")
+    _save_deck_png_svg(
+        fig, "deck_act1_synapse_ribbons_liberman_strains", dpi=_COHORT_RIBBONS_DPI
     )
 
 

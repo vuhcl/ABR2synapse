@@ -36,7 +36,41 @@ MOUSE_SPLIT_RANDOM_STATE = 22
 NN_TRAIN_RANDOM_STATE = 1
 STAGE_SPL_LEVELS: tuple[int, ...] = (50, 60, 70, 80)
 
+# Strain encoding (both cohorts): 0 = CBA/CaJ, 1 = C57BL/6J; Brad/Buran are all 0.
+STRAIN_BINARY_COL = "strain_binary"
+STRAIN_ENCODING: dict[int, str] = {0: "CBA/CaJ", 1: "C57BL/6J"}
+
 _WIDE_SPL_LEVEL_SUFFIX_RE = re.compile(r"_(\d+(?:\.\d+)?)$")
+
+
+def detect_has_strain(
+    reformatted: pd.DataFrame,
+    reformatted_orig: pd.DataFrame,
+    orig_lib: pd.DataFrame,
+) -> bool:
+    """True when strain is present on Brad wide, Liberman wide, and Liberman long."""
+    return (
+        STRAIN_BINARY_COL in reformatted.columns
+        and STRAIN_BINARY_COL in reformatted_orig.columns
+        and STRAIN_BINARY_COL in orig_lib.columns
+    )
+
+
+def append_strain_binary(num_feats: list[str], *, include: bool) -> list[str]:
+    if include and STRAIN_BINARY_COL not in num_feats:
+        return list(num_feats) + [STRAIN_BINARY_COL]
+    return list(num_feats)
+
+
+def validate_strain_encoding(brad_buran_df: pd.DataFrame, orig_lib: pd.DataFrame) -> None:
+    if STRAIN_BINARY_COL not in brad_buran_df.columns:
+        return
+    if not brad_buran_df[STRAIN_BINARY_COL].eq(0).all():
+        raise ValueError("Brad strain_binary must be all 0 (CBA/CaJ)")
+    if STRAIN_BINARY_COL in orig_lib.columns:
+        lib = orig_lib[STRAIN_BINARY_COL]
+        if not lib.isin([0, 1]).all():
+            raise ValueError("Liberman strain_binary must be in {0, 1}")
 
 
 # Long-format Stage 2 tabular numeric columns
@@ -142,7 +176,7 @@ def assert_wide_feats_stage_spl(
 def syn_feats_from_wide_common(
     common_cols: list | tuple,
     *,
-    has_strain: bool = False,
+    has_strain: bool = True,
 ) -> tuple[list[str], list[str], list[str]]:
     """
     Stage-2 **wide** tabular features (same logic as ``abr_wide_long_comparison``):
@@ -163,8 +197,8 @@ def syn_feats_from_wide_common(
     for extra in _EXTRA_WIDE_FEATURES:
         if extra in common:
             syn_num.append(extra)
-    if has_strain and "strain_binary" in common:
-        syn_num.append("strain_binary")
+    if has_strain:
+        syn_num.append(STRAIN_BINARY_COL)
     syn_num = sorted(set(syn_num))
     return syn_num, syn_log, syn_cat
 
@@ -211,12 +245,19 @@ def split_by_mouse(
     return data
 
 
-def _noise_feats_from_wide(columns, *, include_extra_wide: bool = False):
+def _noise_feats_from_wide(
+    columns,
+    *,
+    include_extra_wide: bool = False,
+    include_strain: bool = False,
+):
     """
     Wide columns used by the Stage 1 noise RF.
 
     ``include_extra_wide``: when True, add animal×frequency aggregates
     ``Slope_all``, ``Slope_high4``, ``p1_latency`` (same as ``newfeats`` notebook).
+
+    ``include_strain``: default False — strain is Stage 2 synapse/long only, not noise clf.
     """
     cols = list(columns)
     spl_cols = set(wide_columns_at_stage_spl(cols))
@@ -229,6 +270,7 @@ def _noise_feats_from_wide(columns, *, include_extra_wide: bool = False):
         for c in _EXTRA_WIDE_FEATURES:
             if c in cols:
                 num.append(c)
+    num = append_strain_binary(num, include=include_strain)
     return num, log
 
 
@@ -916,8 +958,8 @@ def load_nn_stage2_data(
     ``include_extra_wide_features``: when True, **Stage 1** wide RF and **Stage 2**
     tabular numeric inputs both include ``Slope_all``, ``Slope_high4``, and ``p1_latency``
     (matches ``abr_wide_long_comparison_newfeats``). Default False: Stage 1 uses only
-    pivoted level-wise wide columns; Stage 2 uses ``LONG_NUM_BASE`` (amplitude, slope,
-    distance, level) plus optional ``strain_binary``.
+    pivoted level-wise wide columns (never ``strain_binary``). Stage 2 long/synapse
+    features append ``strain_binary`` when ``has_strain``.
 
     ``join_io_features``: when True, join ``Slope_all``, ``Slope_high4``, ``p1_latency``
     onto wide tables. Default False matches ``abr_wide_long_comparison`` Liberman pivot.
@@ -943,24 +985,23 @@ def load_nn_stage2_data(
         reformatted_orig,
         include_extra_wide=include_extra_wide_features,
     )
+    has_strain = detect_has_strain(reformatted, reformatted_orig, orig_lib)
     noise_num_bb, noise_log_bb = _noise_feats_from_wide(
-        reformatted.columns, include_extra_wide=include_extra_wide_features
+        reformatted.columns,
+        include_extra_wide=include_extra_wide_features,
     )
     noise_num_lib, noise_log_lib = _noise_feats_from_wide(
-        reformatted_orig.columns, include_extra_wide=include_extra_wide_features
+        reformatted_orig.columns,
+        include_extra_wide=include_extra_wide_features,
     )
     noise_num_common, noise_log_common = _noise_feats_from_wide(
-        common, include_extra_wide=include_extra_wide_features
+        common,
+        include_extra_wide=include_extra_wide_features,
     )
 
-    has_strain = (
-        "strain_binary" in reformatted.columns
-        and "strain_binary" in reformatted_orig.columns
-        and "strain_binary" in orig_lib.columns
-    )
-    long_num = (
-        (LONG_NUM if include_extra_wide_features else LONG_NUM_BASE)
-        + (["strain_binary"] if has_strain else [])
+    long_num = append_strain_binary(
+        LONG_NUM if include_extra_wide_features else LONG_NUM_BASE,
+        include=has_strain,
     )
 
     tw_bb, _, _ = compute_full_wave_target_len(
@@ -969,6 +1010,8 @@ def load_nn_stage2_data(
         prefer_liberman_len=False,
     )
     tw_primary = tw_lib if full_wave_prefer_liberman_len else tw_bb
+
+    validate_strain_encoding(brad_buran_df, orig_lib)
 
     return NNStage2Data(
         brad_buran_df=brad_buran_df,

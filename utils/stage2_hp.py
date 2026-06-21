@@ -1,4 +1,4 @@
-"""Hyperparameter search for Stage-2 scenarios A/B (Section 5.3)."""
+"""Hyperparameter search for Stage-2 scenarios A/B/C (Section 5.3)."""
 from __future__ import annotations
 
 import itertools
@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 from sklearn.metrics import r2_score
 
-from utils.liberman_classical import liberman_feature_lists, stage2_feature_lists
+from utils.liberman_classical import NoiseLabel, liberman_feature_lists, stage2_feature_lists
 from utils.nn_stage2 import (
     MLPRegressor,
     _train_loop,
@@ -57,21 +57,34 @@ def stage1_augment_wide(
     noise_num: List[str],
     noise_log: List[str],
 ) -> pd.DataFrame:
-    wide_test = wide_df.loc[wide_df["DataGroup"].eq("Test")].reset_index(drop=True)
+    return augment_wide_for_hp(wide_df, noise_num, noise_log, noise_label="predicted")
+
+
+def augment_wide_for_hp(
+    wide_df: pd.DataFrame,
+    noise_num: List[str],
+    noise_log: List[str],
+    *,
+    noise_label: NoiseLabel = "predicted",
+) -> pd.DataFrame:
+    wide = wide_df.reset_index(drop=True)
+    if noise_label == "true":
+        if "noise_cat" not in wide.columns:
+            raise ValueError("true-noise HP requires noise_cat on wide frame")
+        return wide
+    wide_test = wide.loc[wide["DataGroup"].eq("Test")].reset_index(drop=True)
     s1 = fit_stage1_wide_best(
-        wide_stage1_fit(wide_df),
-        wide_stage1_val(wide_df),
+        wide_stage1_fit(wide),
+        wide_stage1_val(wide),
         wide_test,
         noise_num,
         noise_log,
         random_state=1,
         verbose=False,
     )
-    animal_pred = stage1_animal_pred_covering(
-        wide_df.reset_index(drop=True), s1, noise_num, noise_log
-    )
+    animal_pred = stage1_animal_pred_covering(wide, s1, noise_num, noise_log)
     return attach_noise_preds_long(
-        wide_df.reset_index(drop=True),
+        wide,
         animal_pred,
         fallback_noise_cat=False,
         require_full_coverage=True,
@@ -92,10 +105,30 @@ def hp_pool_non_test(
     List[str],
     List[str],
 ]:
+    """Backward-compatible wrapper: scenarios A/B only, predicted noise."""
+    return hp_pool_for_scenario(data, scenario, noise_label="predicted")
+
+
+def hp_pool_for_scenario(
+    data: NNStage2Data,
+    scenario: Literal["A", "B", "C"],
+    *,
+    noise_label: NoiseLabel = "predicted",
+) -> Tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    List[str],
+    List[str],
+    List[str],
+    List[str],
+    List[str],
+    List[str],
+    List[str],
+]:
     """Conservative non-test pools for HP tuning (wide + long)."""
     feats = liberman_feature_lists(data.reformatted_orig, data.common_cols)
     syn_num, syn_log, syn_cat, long_num, long_cat = stage2_feature_lists(
-        feats, noise_label="predicted"
+        feats, noise_label=noise_label
     )
     long_log = list(feats["long_log"])
     bb_w = data.reformatted.loc[data.reformatted["DataGroup"] != "Test"].reset_index(
@@ -116,10 +149,13 @@ def hp_pool_non_test(
     if scenario == "A":
         wide, long = bb_w, bb_l
         nn, nl = list(data.noise_num_bb), list(data.noise_log_bb)
-    else:
+    elif scenario == "B":
         wide = pd.concat([bb_w, lib_w], ignore_index=True)
         long = pd.concat([bb_l, lib_l], ignore_index=True)
         nn, nl = list(data.noise_num_common), list(data.noise_log_common)
+    else:
+        wide, long = lib_w, lib_l
+        nn, nl = list(data.noise_num_lib), list(data.noise_log_lib)
 
     return wide, long, nn, nl, syn_num, syn_log, syn_cat, long_num, long_cat, long_log
 
@@ -132,9 +168,10 @@ def tune_scenario_sklearn(
     syn_cat: List[str],
     syn_log: List[str],
     *,
+    noise_label: NoiseLabel = "predicted",
     rf_n_iter: int = 24,
 ) -> Dict[str, Any]:
-    aug = stage1_augment_wide(wide_df, noise_num, noise_log)
+    aug = augment_wide_for_hp(wide_df, noise_num, noise_log, noise_label=noise_label)
     tr = train_only_frame(aug).reset_index(drop=True)
     _, rf_cv, rf_bp = _fit_stage2_rf(
         tr, syn_num, syn_cat, syn_log, n_iter=rf_n_iter, random_state=1
@@ -155,27 +192,32 @@ def tune_scenario_mlp(
     long_cat: List[str],
     long_log: List[str],
     *,
+    noise_label: NoiseLabel = "predicted",
     device: torch.device | None = None,
     holdout_rs: int = 1,
     verbose: bool = False,
+    max_trials: int | None = None,
 ) -> Tuple[Dict[str, Any], pd.DataFrame]:
-    """72-config grid; early stop on official Validate; pick by Train 10% holdout RMSE."""
+    """Grid search; early stop on official Validate; pick by Train 10% holdout RMSE."""
     device = device or resolve_torch_device()
-    aug_w = stage1_augment_wide(wide_df, noise_num, noise_log)
-    s1 = fit_stage1_wide_best(
-        wide_stage1_fit(wide_df),
-        wide_stage1_val(wide_df),
-        wide_df.loc[wide_df["DataGroup"].eq("Test")].reset_index(drop=True),
-        noise_num,
-        noise_log,
-        verbose=False,
-    )
-    long_aug = attach_noise_preds_long(
-        long_df.reset_index(drop=True),
-        s1["animal_pred_non_test"],
-        fallback_noise_cat=False,
-        require_full_coverage=True,
-    )
+    if noise_label == "true":
+        long_aug = long_df.reset_index(drop=True)
+    else:
+        aug_w = augment_wide_for_hp(wide_df, noise_num, noise_log, noise_label="predicted")
+        s1 = fit_stage1_wide_best(
+            wide_stage1_fit(wide_df),
+            wide_stage1_val(wide_df),
+            wide_df.loc[wide_df["DataGroup"].eq("Test")].reset_index(drop=True),
+            noise_num,
+            noise_log,
+            verbose=False,
+        )
+        long_aug = attach_noise_preds_long(
+            long_df.reset_index(drop=True),
+            s1["animal_pred_non_test"],
+            fallback_noise_cat=False,
+            require_full_coverage=True,
+        )
     long_tr = long_aug[long_aug["DataGroup"].eq("Train")].reset_index(drop=True)
     long_val = long_aug[long_aug["DataGroup"].eq("Validate")].reset_index(drop=True)
     if len(long_val) == 0:
@@ -190,6 +232,8 @@ def tune_scenario_mlp(
     grid = list(
         itertools.product(MLP_HIDDEN_GRID, DROPOUT_GRID, LR_GRID, WEIGHT_DECAY_GRID)
     )
+    if max_trials is not None:
+        grid = grid[: int(max_trials)]
     rows: List[Dict[str, Any]] = []
     best_cfg: Dict[str, Any] | None = None
     best_rmse = float("inf")
@@ -245,16 +289,18 @@ def tune_scenario_mlp(
     return best_cfg, pd.DataFrame(rows)
 
 
-def tune_scenario_ab(
+def tune_scenario(
     data: NNStage2Data,
-    scenario: Literal["A", "B"],
+    scenario: Literal["A", "B", "C"],
     *,
+    noise_label: NoiseLabel = "predicted",
     rf_n_iter: int = 24,
+    mlp_max_trials: int | None = None,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> Tuple[Dict[str, Any], pd.DataFrame]:
-    wide, long, nn, nl, syn_num, syn_log, syn_cat, long_num, long_cat, long_log = hp_pool_non_test(
-        data, scenario
+    wide, long, nn, nl, syn_num, syn_log, syn_cat, long_num, long_cat, long_log = (
+        hp_pool_for_scenario(data, scenario, noise_label=noise_label)
     )
     test_ids = set()
     if "Test" in wide["DataGroup"].values:
@@ -263,11 +309,14 @@ def tune_scenario_ab(
 
     if verbose:
         print(
-            f"Scenario {scenario}: wide={len(wide)} rows "
+            f"Scenario {scenario} ({noise_label}): wide={len(wide)} rows "
             f"({wide['animal_id'].nunique()} animals), long={len(long)} rows"
         )
 
-    sk = tune_scenario_sklearn(wide, nn, nl, syn_num, syn_cat, syn_log, rf_n_iter=rf_n_iter)
+    sk = tune_scenario_sklearn(
+        wide, nn, nl, syn_num, syn_cat, syn_log,
+        noise_label=noise_label, rf_n_iter=rf_n_iter,
+    )
     mlp_hp, mlp_trials = tune_scenario_mlp(
         wide,
         long,
@@ -276,19 +325,40 @@ def tune_scenario_ab(
         long_num,
         long_cat,
         long_log,
+        noise_label=noise_label,
         device=device,
         verbose=verbose,
+        max_trials=mlp_max_trials,
     )
     payload = {
         "scenario": scenario,
         "config_id": "T5",
         "format": "wide",
-        "noise_label": "predicted",
+        "noise_label": noise_label,
         **sk,
         "MLP": mlp_hp,
     }
     mlp_trials["scenario"] = scenario
+    mlp_trials["noise_label"] = noise_label
     return _json_sanitize(payload), mlp_trials
+
+
+def tune_scenario_ab(
+    data: NNStage2Data,
+    scenario: Literal["A", "B"],
+    *,
+    rf_n_iter: int = 24,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> Tuple[Dict[str, Any], pd.DataFrame]:
+    return tune_scenario(
+        data,
+        scenario,
+        noise_label="predicted",
+        rf_n_iter=rf_n_iter,
+        device=device,
+        verbose=verbose,
+    )
 
 
 def write_scenario_hp_json(payload: Dict[str, Any], path: Path) -> None:

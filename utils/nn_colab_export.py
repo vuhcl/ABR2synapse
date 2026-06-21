@@ -33,6 +33,11 @@ from utils.nn_stage2_data import (
     wide_stage1_val,
 )
 
+from utils.liberman_classical import (
+    NoiseLabel,
+    animal_noise_series,
+    attach_animal_noise_cat,
+)
 from utils.nn_colab_train import (
     DROPOUT_GRID,
     LR_GRID,
@@ -42,12 +47,14 @@ from utils.nn_colab_train import (
 )
 
 DEFAULT_OUT = Path("figures/cache/nn_colab_liberman")
+DEFAULT_TRUE_OUT = Path("figures/cache/nn_colab_liberman_true")
 
 
 def _stage2_long_frames(
     data: NNStage2Data,
     *,
-    exclude_strain: bool = True,
+    exclude_strain: bool = False,
+    noise_label: NoiseLabel = "predicted",
 ):
     sp = splits_for_long_stage2(data)
     lib_tr = sp["lib_train"].copy()
@@ -59,23 +66,30 @@ def _stage2_long_frames(
     if exclude_strain:
         nn_data = replace(data, long_num=[c for c in data.long_num if c != "strain_binary"])
 
-    s1_fit = wide_stage1_fit(lib_tr)
-    s1_val = wide_stage1_val(lib_tr)
-    s1 = fit_stage1_wide_best(
-        s1_fit,
-        s1_val,
-        lib_te,
-        data.noise_num_lib,
-        data.noise_log_lib,
-        random_state=NN_TRAIN_RANDOM_STATE,
-        verbose=True,
-    )
-    long_tr = attach_noise_preds_long(
-        long_tr,
-        s1["animal_pred_non_test"],
-        require_full_coverage=True,
-    )
-    long_te = attach_noise_preds_long(long_te, s1["animal_pred_te"])
+    if noise_label == "true":
+        animal_noise = animal_noise_series(data.orig_lib)
+        long_tr = attach_animal_noise_cat(long_tr, animal_noise)
+        long_te = attach_animal_noise_cat(long_te, animal_noise)
+        long_cat = ["noise_cat"]
+    else:
+        s1_fit = wide_stage1_fit(lib_tr)
+        s1_val = wide_stage1_val(lib_tr)
+        s1 = fit_stage1_wide_best(
+            s1_fit,
+            s1_val,
+            lib_te,
+            data.noise_num_lib,
+            data.noise_log_lib,
+            random_state=NN_TRAIN_RANDOM_STATE,
+            verbose=True,
+        )
+        long_tr = attach_noise_preds_long(
+            long_tr,
+            s1["animal_pred_non_test"],
+            require_full_coverage=True,
+        )
+        long_te = attach_noise_preds_long(long_te, s1["animal_pred_te"])
+        long_cat = list(nn_data.long_cat)
 
     long_fit = long_tr[long_tr["DataGroup"] == "Train"].reset_index(drop=True)
     long_val = long_tr[long_tr["DataGroup"] == "Validate"].reset_index(drop=True)
@@ -86,7 +100,7 @@ def _stage2_long_frames(
     if fit_animals & val_animals:
         raise ValueError("Train and Validate animals must be disjoint")
 
-    return nn_data, long_fit, long_val, long_te
+    return nn_data, long_fit, long_val, long_te, long_cat
 
 
 def _pack_split(
@@ -106,21 +120,26 @@ def _pack_split(
 
 
 def export_liberman_nn_colab_pack(
-    out_dir: Path | str = DEFAULT_OUT,
+    out_dir: Path | str | None = None,
     *,
     data: NNStage2Data | None = None,
     cfg: RunConfig | None = None,
+    exclude_strain: bool = False,
+    noise_label: NoiseLabel = "predicted",
 ) -> Path:
     """Build Colab artifact directory; returns ``out_dir``."""
+    if out_dir is None:
+        out_dir = DEFAULT_TRUE_OUT if noise_label == "true" else DEFAULT_OUT
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     data = data or load_nn_stage2_data(join_io_features=False)
     cfg = cfg or RunConfig(full_wave_ref="lib")
-    nn_data, long_fit, long_val, long_te = _stage2_long_frames(data)
+    nn_data, long_fit, long_val, long_te, long_cat = _stage2_long_frames(
+        data, exclude_strain=exclude_strain, noise_label=noise_label
+    )
 
     long_num = nn_data.long_num
-    long_cat = nn_data.long_cat
     long_log = nn_data.long_log
     prep = syn_prep_transformer(long_num, long_cat, long_log)
 
@@ -155,8 +174,8 @@ def export_liberman_nn_colab_pack(
 
     manifest: dict[str, Any] = {
         "cohort": "liberman",
-        "noise_label": "predicted",
-        "exclude_strain": True,
+        "noise_label": noise_label,
+        "exclude_strain": exclude_strain,
         "n_tabular": int(X_tr.shape[1]),
         "tabular_columns": tab_cols,
         "wave_i_len": 30,
