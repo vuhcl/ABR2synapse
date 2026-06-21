@@ -111,6 +111,7 @@ SEED_RUNS_PARQUET = resolve_cache_file("benchmark_metrics_by_seed.parquet")
 # Section 5.3 — synthesis CV + HP artifacts (written by stage2 notebooks / scripts)
 STAGE2_DATA_DIR = CACHE_DIR / "stage2_data"
 STAGE2_BEST_HP_DIR = CACHE_DIR / "stage2_best_hp"
+STAGE2_BEST_HP_TRUE_DIR = CACHE_DIR / "stage2_best_hp_true"
 LIBERMAN_T5_SKLEARN_HP_JSON = STAGE2_BEST_HP_DIR / "liberman_t5_sklearn.json"
 STAGE2_SYNTHESIS_CV_PROGRESS_JSON = CACHE_DIR / "stage2_synthesis_cv_progress.json"
 STAGE2_SYNTHESIS_CV_FOLDS_PARQUET = CACHE_DIR / "stage2_synthesis_cv_folds.parquet"
@@ -142,23 +143,51 @@ STAGE2_SYNTHESIS_STAGE1_TABLE_PARQUET = (
 def stage2_synthesis_cv_paths(
     n_folds: int,
 ) -> tuple[Path, Path, Path]:
-    """
-    Cache paths for synthesis CV keyed by fold count.
+    return synthesis_cv_cache_paths(n_folds, variant="predicted")[:3]
 
-    ``n_folds=10`` uses the legacy unsuffixed filenames (existing runs).
-    Other counts use ``stage2_synthesis_cv_{n}fold_*`` under ``figures/cache/``.
+
+def synthesis_cv_cache_paths(
+    n_folds: int,
+    *,
+    variant: Literal["predicted", "true"] = "predicted",
+) -> tuple[Path, Path, Path, Path, Path, Path, Path, Path, Path, Path]:
     """
+    Cache paths for synthesis CV keyed by fold count and noise variant.
+
+    Returns:
+        folds, progress, summary, pooled_folds, pooled_progress,
+        oof, oof_progress, pooled_oof, pooled_oof_progress, oof_r2_summary
+    """
+    prefix = "stage2_synthesis_cv"
+    if variant == "true":
+        prefix = "stage2_synthesis_cv_true"
     if n_folds == 10:
-        return (
-            STAGE2_SYNTHESIS_CV_FOLDS_PARQUET,
-            STAGE2_SYNTHESIS_CV_PROGRESS_JSON,
-            STAGE2_SYNTHESIS_CV_SUMMARY_PARQUET,
-        )
-    tag = f"{n_folds}fold"
+        folds = CACHE_DIR / f"{prefix}_folds.parquet"
+        progress = CACHE_DIR / f"{prefix}_progress.json"
+        summary = CACHE_DIR / f"{prefix}_summary.parquet"
+    else:
+        tag = f"{n_folds}fold"
+        folds = CACHE_DIR / f"{prefix}_{tag}_folds.parquet"
+        progress = CACHE_DIR / f"{prefix}_{tag}_progress.json"
+        summary = CACHE_DIR / f"{prefix}_{tag}_summary.parquet"
+    pooled_folds = CACHE_DIR / f"{prefix}_pooled_folds.parquet"
+    pooled_progress = CACHE_DIR / f"{prefix}_pooled_progress.json"
+    oof = CACHE_DIR / f"{prefix}_oof.parquet"
+    oof_progress = CACHE_DIR / f"{prefix}_oof_progress.json"
+    pooled_oof = CACHE_DIR / f"{prefix}_pooled_oof.parquet"
+    pooled_oof_progress = CACHE_DIR / f"{prefix}_pooled_oof_progress.json"
+    oof_r2_summary = CACHE_DIR / f"{prefix}_oof_r2_summary.parquet"
     return (
-        CACHE_DIR / f"stage2_synthesis_cv_{tag}_folds.parquet",
-        CACHE_DIR / f"stage2_synthesis_cv_{tag}_progress.json",
-        CACHE_DIR / f"stage2_synthesis_cv_{tag}_summary.parquet",
+        folds,
+        progress,
+        summary,
+        pooled_folds,
+        pooled_progress,
+        oof,
+        oof_progress,
+        pooled_oof,
+        pooled_oof_progress,
+        oof_r2_summary,
     )
 
 LIBERMAN_GROUP_MEAN_BASELINE_PARQUET = resolve_cache_file(
