@@ -18,6 +18,8 @@ from utils.nn_stage2_data import (
     LONG_LOG,
     LONG_NUM_BASE,
     STAGE_SPL_LEVELS,
+    STRAIN_BINARY_COL,
+    append_strain_binary,
     assert_wide_feats_stage_spl,
     wide_stage1_fit,
     wide_stage1_val,
@@ -57,6 +59,13 @@ TREE_CONFIGS: Tuple[TreeConfig, ...] = (
     TreeConfig("T6", "wide", "true"),
 )
 
+TRUE_NOISE_TREE_CONFIGS: Tuple[TreeConfig, ...] = (
+    TreeConfig("T1", "long", "none"),
+    TreeConfig("T3", "long", "true"),
+    TreeConfig("T4", "wide", "none"),
+    TreeConfig("T5", "wide", "true"),
+)
+
 
 def attach_animal_noise_cat(df: pd.DataFrame, animal_noise: pd.Series) -> pd.DataFrame:
     out = df.copy()
@@ -75,25 +84,34 @@ def filter_syn_num(syn_num: List[str]) -> List[str]:
 def liberman_feature_lists(
     reformatted_orig: pd.DataFrame,
     common_cols: list | tuple,
+    *,
+    has_strain: bool | None = None,
 ) -> Dict[str, Any]:
+    if has_strain is None:
+        has_strain = STRAIN_BINARY_COL in reformatted_orig.columns
     syn_num, syn_log, syn_cat = syn_feats_from_wide_common(
-        common_cols, has_strain=False
+        common_cols, has_strain=has_strain
     )
     syn_num = filter_syn_num(syn_num)
     noise_num, noise_log = _noise_feats_from_wide(
-        reformatted_orig.columns, include_extra_wide=False
+        reformatted_orig.columns,
+        include_extra_wide=False,
     )
     assert_wide_feats_stage_spl(syn_num + syn_log + noise_num + noise_log)
+    long_num_base = list(LONG_NUM_BASE)
+    long_num = append_strain_binary(long_num_base, include=has_strain)
     return {
         "syn_num": syn_num,
         "syn_log": syn_log,
         "syn_cat_default": syn_cat,
         "noise_num": noise_num,
         "noise_log": noise_log,
-        "long_num_base": list(LONG_NUM_BASE),
+        "long_num_base": long_num_base,
+        "long_num": long_num,
         "long_log": list(LONG_LOG),
         "long_cat_default": list(LONG_CAT),
         "stage_spl_levels": list(STAGE_SPL_LEVELS),
+        "has_strain": has_strain,
     }
 
 
@@ -101,7 +119,9 @@ def stage2_feature_lists(
     feats: Dict[str, Any], *, noise_label: NoiseLabel
 ) -> Tuple[List[str], List[str], List[str], List[str]]:
     syn_num = list(feats["syn_num"])
-    long_num = list(feats["long_num_base"])
+    long_num = list(feats.get("long_num") or feats["long_num_base"])
+    if feats.get("has_strain") and STRAIN_BINARY_COL not in long_num:
+        long_num = append_strain_binary(long_num, include=True)
 
     if noise_label == "none":
         syn_cat: List[str] = []
@@ -171,6 +191,32 @@ def ols_wide_full_noise_pred(
     return r2, rmse
 
 
+def ols_wide_full_noise_true(
+    wide_train: pd.DataFrame,
+    wide_test: pd.DataFrame,
+    syn_num: List[str],
+    syn_log: List[str],
+) -> Tuple[float, float]:
+    num_cols = list(syn_num)
+    formula = "synapses ~ C(noise_cat)"
+    for col in num_cols + syn_log:
+        formula += f" + Q('{col}')"
+    dropna_cols = ["noise_cat"] + num_cols + syn_log
+    tr_clean = wide_train.dropna(subset=dropna_cols + ["synapses"])
+    te_clean = wide_test.dropna(subset=dropna_cols + ["synapses"])
+    model = smf.ols(formula, data=tr_clean).fit()
+    pred = model.predict(te_clean)
+    r2 = float(r2_score(te_clean["synapses"], pred))
+    rmse = float(np.sqrt(np.mean((te_clean["synapses"].values - pred.values) ** 2)))
+    return r2, rmse
+
+
+def _skip_stage1_for_cfg(cfg: TreeConfig, *, skip_stage1: bool) -> bool:
+    if not skip_stage1:
+        return False
+    return cfg.noise_label in ("none", "true")
+
+
 def run_tree_config(
     cfg: TreeConfig,
     *,
@@ -181,6 +227,7 @@ def run_tree_config(
     long_test: pd.DataFrame,
     feats: Dict[str, Any],
     verbose: bool = False,
+    skip_stage1: bool = False,
 ) -> Tuple[float, float]:
     syn_num, syn_log, syn_cat, long_num, long_cat = stage2_feature_lists(
         feats, noise_label=cfg.noise_label
@@ -189,6 +236,7 @@ def run_tree_config(
     noise_num = feats["noise_num"]
     noise_log = feats["noise_log"]
     label = f"{cfg.config_id}-{model}"
+    do_skip = _skip_stage1_for_cfg(cfg, skip_stage1=skip_stage1)
 
     if cfg.format == "long":
         if verbose:
@@ -216,6 +264,7 @@ def run_tree_config(
             long_cat=long_cat,
             long_log=long_log,
             model=model,
+            skip_stage1=do_skip,
         )
         return metrics_from_animal_frequency_agg(agg)
 
@@ -228,6 +277,7 @@ def run_tree_config(
         syn_cat=syn_cat,
         syn_log=syn_log,
         model=model,
+        skip_stage1=do_skip,
     )
     return metrics_from_animal_frequency_agg(agg)
 
@@ -333,10 +383,13 @@ def run_config_panel(
     feats: Dict[str, Any],
     *,
     verbose: bool = True,
+    tree_configs: Tuple[TreeConfig, ...] = TREE_CONFIGS,
+    skip_stage1: bool = False,
+    ols_noise_mode: NoiseLabel = "predicted",
 ) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
 
-    for cfg in TREE_CONFIGS:
+    for cfg in tree_configs:
         for model in ("RF", "XGB"):
             if verbose:
                 print(f"\n=== {cfg.config_id} {model} ({cfg.format}, noise={cfg.noise_label}) ===")
@@ -349,6 +402,7 @@ def run_config_panel(
                 long_test=long_test,
                 feats=feats,
                 verbose=verbose,
+                skip_stage1=skip_stage1,
             )
             append_result(
                 rows,
@@ -375,21 +429,29 @@ def run_config_panel(
     )
 
     if verbose:
-        print("\n=== L8 OLS full + noise_preds (wide) ===")
-    r2_l8, rmse_l8 = ols_wide_full_noise_pred(
-        wide_train,
-        wide_test,
-        syn_num,
-        feats["syn_log"],
-        feats["noise_num"],
-        feats["noise_log"],
-    )
+        l8_label = "noise_cat" if ols_noise_mode == "true" else "noise_preds"
+        print(f"\n=== L8 OLS full + {l8_label} (wide) ===")
+    if ols_noise_mode == "true":
+        r2_l8, rmse_l8 = ols_wide_full_noise_true(
+            wide_train, wide_test, syn_num, feats["syn_log"]
+        )
+        l8_noise = "true"
+    else:
+        r2_l8, rmse_l8 = ols_wide_full_noise_pred(
+            wide_train,
+            wide_test,
+            syn_num,
+            feats["syn_log"],
+            feats["noise_num"],
+            feats["noise_log"],
+        )
+        l8_noise = "predicted"
     append_result(
         rows,
         config_id="L8",
         model="OLS",
         format="wide",
-        noise_label="predicted",
+        noise_label=l8_noise,
         r2_test=r2_l8,
         rmse_test=rmse_l8,
     )
@@ -420,6 +482,13 @@ def _unit_index(df: pd.DataFrame) -> pd.Index:
     )
 
 
+COMPARISON_PAIRS_TRUE: Tuple[Tuple[str, str, str], ...] = (
+    ("Q3_format", "T1", "T4"),
+    ("Q1_noise", "T4", "T5"),
+    ("Q1_noise_long", "T1", "T3"),
+)
+
+
 def tree_config_test_sq_errors(
     cfg: TreeConfig,
     *,
@@ -429,6 +498,7 @@ def tree_config_test_sq_errors(
     long_train: pd.DataFrame,
     long_test: pd.DataFrame,
     feats: Dict[str, Any],
+    skip_stage1: bool = False,
 ) -> pd.Series:
     """Per animal×frequency squared test error (aligned unit index)."""
     syn_num, syn_log, syn_cat, long_num, long_cat = stage2_feature_lists(
@@ -437,6 +507,7 @@ def tree_config_test_sq_errors(
     noise_num = list(feats["noise_num"])
     noise_log = list(feats["noise_log"])
     long_log = list(feats["long_log"])
+    do_skip = _skip_stage1_for_cfg(cfg, skip_stage1=skip_stage1)
 
     if cfg.format == "long":
         agg = long_stage2_test_agg(
@@ -450,6 +521,7 @@ def tree_config_test_sq_errors(
             long_cat=long_cat,
             long_log=long_log,
             model=model,
+            skip_stage1=do_skip,
         )
     else:
         agg = wide_stage2_test_agg(
@@ -461,6 +533,7 @@ def tree_config_test_sq_errors(
             syn_cat=syn_cat,
             syn_log=syn_log,
             model=model,
+            skip_stage1=do_skip,
         )
     sq = (agg["y_true"].astype(float) - agg["y_pred"].astype(float)) ** 2
     return pd.Series(sq.values, index=_unit_index(agg), name="sq_err")
@@ -474,9 +547,11 @@ def build_sq_error_cache(
     feats: Dict[str, Any],
     *,
     models: Tuple[str, ...] = ("RF", "XGB"),
+    tree_configs: Tuple[TreeConfig, ...] = TREE_CONFIGS,
+    skip_stage1: bool = False,
 ) -> Dict[Tuple[str, str], pd.Series]:
     cache: Dict[Tuple[str, str], pd.Series] = {}
-    for cfg in TREE_CONFIGS:
+    for cfg in tree_configs:
         for model in models:
             key = (cfg.config_id, model)
             cache[key] = tree_config_test_sq_errors(
@@ -487,6 +562,7 @@ def build_sq_error_cache(
                 long_train=long_train,
                 long_test=long_test,
                 feats=feats,
+                skip_stage1=skip_stage1,
             )
     return cache
 
@@ -602,6 +678,9 @@ def derive_comparisons(
     feats: Optional[Dict[str, Any]] = None,
     alpha: float = 0.05,
     sq_error_cache: Optional[Dict[Tuple[str, str], pd.Series]] = None,
+    comparison_pairs: Tuple[Tuple[str, str, str], ...] = COMPARISON_PAIRS,
+    tree_configs: Tuple[TreeConfig, ...] = TREE_CONFIGS,
+    skip_stage1: bool = False,
 ) -> pd.DataFrame:
     """
     Q1–Q3 (+ Q2 oracle) pairwise tables for RF and XGB.
@@ -617,12 +696,18 @@ def derive_comparisons(
     cache = sq_error_cache
     if run_tests and cache is None:
         cache = build_sq_error_cache(
-            wide_train, wide_test, long_train, long_test, feats  # type: ignore[arg-type]
+            wide_train,
+            wide_test,
+            long_train,
+            long_test,
+            feats,  # type: ignore[arg-type]
+            tree_configs=tree_configs,
+            skip_stage1=skip_stage1,
         )
 
     comps: List[Dict[str, Any]] = []
     for model in ("RF", "XGB"):
-        for q, a, b in COMPARISON_PAIRS:
+        for q, a, b in comparison_pairs:
             row = pairwise_delta(results, a, b, model, question=q)
             if row is None:
                 continue
@@ -648,9 +733,16 @@ def best_tree_format(results: pd.DataFrame, model: str) -> str:
     return "wide" if row["delta_r2"] > 0 else "long"
 
 
-def pick_best_tree_config(results: pd.DataFrame) -> Dict[str, Any]:
+def pick_best_tree_config(
+    results: pd.DataFrame,
+    *,
+    noise_label_filter: Optional[str] = None,
+) -> Dict[str, Any]:
     trees = results[results["config_id"].str.startswith("T")].copy()
-    pred = trees[trees["noise_label"] == "predicted"]
+    if noise_label_filter is not None:
+        pred = trees[trees["noise_label"] == noise_label_filter]
+    else:
+        pred = trees[trees["noise_label"] == "predicted"]
     if pred.empty:
         pred = trees
     best_idx = pred["r2_test"].idxmax()
@@ -670,16 +762,24 @@ def export_artifacts(
     results: pd.DataFrame,
     comparisons: pd.DataFrame,
     cache_dir: Path,
+    *,
+    stem: str = "liberman_classical",
 ) -> Tuple[Path, Path, Path]:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    parquet_path = cache_dir / "liberman_classical_comparison.parquet"
-    comp_path = cache_dir / "liberman_classical_comparisons.parquet"
-    json_path = cache_dir / "liberman_best_tree_config.json"
+    parquet_path = cache_dir / f"{stem}_comparison.parquet"
+    comp_path = cache_dir / f"{stem}_comparisons.parquet"
+    if stem == "liberman_classical":
+        json_path = cache_dir / "liberman_best_tree_config.json"
+    elif stem == "liberman_classical_true_noise":
+        json_path = cache_dir / "liberman_true_noise_best_tree_config.json"
+    else:
+        json_path = cache_dir / f"{stem}_best_tree_config.json"
 
     results.to_parquet(parquet_path, index=False)
     comparisons.to_parquet(comp_path, index=False)
 
-    best = pick_best_tree_config(results)
+    noise_filter = "true" if stem.endswith("_true_noise") else None
+    best = pick_best_tree_config(results, noise_label_filter=noise_filter)
     best["comparisons"] = comparisons.to_dict(orient="records")
     json_path.write_text(json.dumps(best, indent=2), encoding="utf-8")
     return parquet_path, json_path, comp_path
