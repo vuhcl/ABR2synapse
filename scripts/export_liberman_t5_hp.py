@@ -2,7 +2,12 @@
 """Export T5 wide RF/XGB best_params for scenario C (Liberman 5.2)."""
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from utils.liberman_classical import export_t5_stage2_hp, liberman_feature_lists
 from utils.nn_stage2_data import load_nn_stage2_data
