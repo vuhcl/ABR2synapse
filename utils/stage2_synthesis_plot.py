@@ -69,11 +69,12 @@ COHORT_PANEL_3_R2_FNAME = "supplementary_figure_S2_pooled_oof_r2.png"
 COHORT_PANEL_FIGSIZE = (16.0, 10.0)
 # Two-column print (~7.2 in); not scaled down from slide size.
 COHORT_PANEL_3_FIGSIZE = (7.2, 3.4)
-COHORT_PANEL_3_WSPACE = 0.46
+COHORT_PANEL_3_WSPACE = 0.55
 COHORT_PANEL_3_LEGEND_ROW_RATIO = 0.15
 COHORT_PANEL_3_DPI = 300
-# Margin label (axes coords): all three panels.
-COHORT_PANEL_3_YLABEL_X = -0.30
+# Margin label (axes coords): left of y tick labels; more negative = more gap.
+COHORT_PANEL_3_YLABEL_X = -0.38
+COHORT_PANEL_3_SUBPLOT_LEFT = 0.17
 COHORT_GRID_COLOR = "0.82"
 COHORT_PANEL_WSPACE = 0.72
 COHORT_YLABEL_X = -0.38
@@ -118,6 +119,7 @@ class CohortPanelDrawStyle:
     tick_length: float
     legend_frame_linewidth: float
     ceiling_line_lw: float
+    ytick_pad: float
 
 
 COHORT_PANEL_3_PRINT_STYLE = CohortPanelDrawStyle(
@@ -137,6 +139,7 @@ COHORT_PANEL_3_PRINT_STYLE = CohortPanelDrawStyle(
     tick_length=2.5,
     legend_frame_linewidth=0.5,
     ceiling_line_lw=1.0,
+    ytick_pad=3.0,
 )
 
 
@@ -394,9 +397,13 @@ def _cohort_ceiling(
 
 
 def _models_for_cohort(summary: pd.DataFrame, test_set: str) -> pd.DataFrame:
+    if test_set == "Pooled":
+        scenario_values = ("1", "2", "3")
+    else:
+        scenario_values = ("A", "B", "C")
     return summary.loc[
         summary["test_set"].eq(test_set)
-        & summary["scenario"].isin(("A", "B", "C"))
+        & summary["scenario"].isin(scenario_values)
         & summary["model"].isin(ACT4_SYNTHESIS_MODELS)
     ].copy()
 
@@ -404,7 +411,7 @@ def _models_for_cohort(summary: pd.DataFrame, test_set: str) -> pd.DataFrame:
 def _display_scenario_index(test_set: str, train_scenario: str) -> int:
     """Map train slice A/B/C to display scenarios 1/2/3 (within / cross / combined)."""
     if test_set == "Pooled":
-        return {"A": 1, "B": 2, "C": 3}[train_scenario]
+        return int(train_scenario)
     if train_scenario == COMBINED_TRAIN:
         return 3
     if train_scenario == WITHIN_COHORT_TRAIN[test_set]:
@@ -690,7 +697,10 @@ def _draw_scenarios_on_ax(
         _errorbar_scenario_row(ax, row, test_set=test_set, style=style, metric=metric)
     _style_model_xaxis(ax, show_xlabels=show_xlabels, style=style)
     tick_fs = style.tick_fontsize if style else COHORT_TICK_FONTSIZE
-    y_pad = 2 if style else 4
+    if style is not None:
+        y_pad = style.ytick_pad
+    else:
+        y_pad = 4
     ax.tick_params(axis="y", labelsize=tick_fs, pad=y_pad)
 
 
@@ -1133,7 +1143,12 @@ def _synthesis_cohort_panels_3cv_impl(
         metric=metric,
     )
 
-    fig.subplots_adjust(bottom=0.20, left=0.14, right=0.99, top=0.96)
+    fig.subplots_adjust(
+        bottom=0.20,
+        left=COHORT_PANEL_3_SUBPLOT_LEFT,
+        right=0.99,
+        top=0.96,
+    )
 
     for ax in (ax_lib, ax_brad, ax_pool):
         _set_cohort_metric_ylabel(

@@ -102,6 +102,82 @@ def _fit_stage2_rf(
     return search.best_estimator_, float(search.best_score_), dict(search.best_params_)
 
 
+def _assert_noise_cat_on_frames(*frames: pd.DataFrame) -> None:
+    for df in frames:
+        if "noise_cat" not in df.columns:
+            raise ValueError("skip_stage1 requires noise_cat on frame")
+        per_animal = df.groupby("animal_id")["noise_cat"].nunique(dropna=True)
+        if (per_animal > 1).any():
+            bad = per_animal[per_animal > 1].index[:3].tolist()
+            raise ValueError(f"noise_cat not constant within animal_id; e.g. {bad}")
+
+
+def _augment_wide_for_stage2(
+    wide_train: pd.DataFrame,
+    wide_test: pd.DataFrame,
+    *,
+    noise_num: List[str],
+    noise_log: List[str],
+    skip_stage1: bool,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[Dict[str, object]]]:
+    if skip_stage1:
+        _assert_noise_cat_on_frames(wide_train, wide_test)
+        return wide_train.copy(), wide_test.copy(), None
+    s1_out = fit_stage1_wide_best(
+        wide_stage1_fit(wide_train),
+        wide_stage1_val(wide_train),
+        wide_test,
+        noise_num,
+        noise_log,
+        random_state=1,
+        verbose=False,
+    )
+    tr_aug = attach_noise_preds_long(
+        wide_train,
+        s1_out["animal_pred_non_test"],
+        fallback_noise_cat=False,
+        require_full_coverage=True,
+    )
+    te_aug = attach_noise_preds_long(
+        wide_test, s1_out["animal_pred_te"], fallback_noise_cat=False
+    )
+    return tr_aug, te_aug, s1_out
+
+
+def _augment_long_for_stage2(
+    wide_train: pd.DataFrame,
+    wide_test: pd.DataFrame,
+    long_train: pd.DataFrame,
+    long_test: pd.DataFrame,
+    *,
+    noise_num: List[str],
+    noise_log: List[str],
+    skip_stage1: bool,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[Dict[str, object]]]:
+    if skip_stage1:
+        _assert_noise_cat_on_frames(long_train, long_test)
+        return long_train.copy(), long_test.copy(), None
+    s1_out = fit_stage1_wide_best(
+        wide_stage1_fit(wide_train),
+        wide_stage1_val(wide_train),
+        wide_test,
+        noise_num,
+        noise_log,
+        random_state=1,
+        verbose=False,
+    )
+    long_tr = attach_noise_preds_long(
+        long_train,
+        s1_out["animal_pred_non_test"],
+        fallback_noise_cat=False,
+        require_full_coverage=True,
+    )
+    long_te = attach_noise_preds_long(
+        long_test, s1_out["animal_pred_te"], fallback_noise_cat=False
+    )
+    return long_tr, long_te, s1_out
+
+
 def _fit_stage2_xgb(
     tr_aug: pd.DataFrame,
     syn_num: List[str],
@@ -141,25 +217,17 @@ def _long_stage2_test_agg(
     long_cat: List[str],
     long_log: List[str],
     model: Literal["RF", "XGB"],
+    skip_stage1: bool = False,
 ) -> Tuple[pd.DataFrame, float, Dict[str, object]]:
     """Animal×frequency test predictions after long Stage 2 (mean pred per cell)."""
-    s1_out = fit_stage1_wide_best(
-        wide_stage1_fit(wide_train),
-        wide_stage1_val(wide_train),
+    long_tr, long_te, s1_out = _augment_long_for_stage2(
+        wide_train,
         wide_test,
-        noise_num,
-        noise_log,
-        random_state=1,
-        verbose=False,
-    )
-    long_tr = attach_noise_preds_long(
         long_train,
-        s1_out["animal_pred_non_test"],
-        fallback_noise_cat=False,
-        require_full_coverage=True,
-    )
-    long_te = attach_noise_preds_long(
-        long_test, s1_out["animal_pred_te"], fallback_noise_cat=False
+        long_test,
+        noise_num=noise_num,
+        noise_log=noise_log,
+        skip_stage1=skip_stage1,
     )
     fit_fn = _fit_stage2_rf if model == "RF" else _fit_stage2_xgb
     reg, cv_r2, _ = fit_fn(long_tr, long_num, long_cat, long_log)
@@ -169,7 +237,7 @@ def _long_stage2_test_agg(
     _eval = long_te.loc[Xs_te.index, ["animal_id", "frequency", "synapses"]].copy()
     _eval["y_pred"] = pd.Series(y_pred_rows, index=Xs_te.index)
     agg = agg_animal_frequency(_eval)
-    return agg, cv_r2, s1_out
+    return agg, cv_r2, s1_out or {}
 
 
 def long_stage2_test_agg(
@@ -184,6 +252,7 @@ def long_stage2_test_agg(
     long_cat: List[str],
     long_log: List[str],
     model: Literal["RF", "XGB"] = "RF",
+    skip_stage1: bool = False,
 ) -> pd.DataFrame:
     """Public wrapper: test-set synapse preds aggregated per animal×frequency."""
     agg, _, _ = _long_stage2_test_agg(
@@ -197,6 +266,7 @@ def long_stage2_test_agg(
         long_cat=long_cat,
         long_log=long_log,
         model=model,
+        skip_stage1=skip_stage1,
     )
     return agg
 
@@ -211,25 +281,15 @@ def wide_stage2_test_agg(
     syn_cat: List[str],
     syn_log: List[str],
     model: Literal["RF", "XGB"] = "RF",
+    skip_stage1: bool = False,
 ) -> pd.DataFrame:
     """Test-set synapse preds aggregated per animal×frequency (wide Stage 2)."""
-    s1_out = fit_stage1_wide_best(
-        wide_stage1_fit(wide_train),
-        wide_stage1_val(wide_train),
-        wide_test,
-        noise_num,
-        noise_log,
-        random_state=1,
-        verbose=False,
-    )
-    tr_aug = attach_noise_preds_long(
+    tr_aug, te_aug, _ = _augment_wide_for_stage2(
         wide_train,
-        s1_out["animal_pred_non_test"],
-        fallback_noise_cat=False,
-        require_full_coverage=True,
-    )
-    te_aug = attach_noise_preds_long(
-        wide_test, s1_out["animal_pred_te"], fallback_noise_cat=False
+        wide_test,
+        noise_num=noise_num,
+        noise_log=noise_log,
+        skip_stage1=skip_stage1,
     )
     fit_fn = _fit_stage2_rf if model == "RF" else _fit_stage2_xgb
     reg, _, _ = fit_fn(tr_aug, syn_num, syn_cat, syn_log)

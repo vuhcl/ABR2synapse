@@ -63,6 +63,8 @@ def _export_cohort_wide(
     noise_num: List[str],
     noise_log: List[str],
     common_cols: List[str],
+    *,
+    has_strain: bool,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     wide_test_rows = wide_df[wide_df["DataGroup"].eq("Test")].reset_index(drop=True)
     s1_out = fit_stage1_wide_best(
@@ -82,7 +84,9 @@ def _export_cohort_wide(
         require_full_coverage=True,
     )
     # syn_feats_from_wide_common returns (syn_num, syn_log, syn_cat)
-    syn_num, syn_log, syn_cat = syn_feats_from_wide_common(common_cols, has_strain=False)
+    syn_num, syn_log, syn_cat = syn_feats_from_wide_common(
+        common_cols, has_strain=has_strain
+    )
     prep = _syn_prep(syn_num, syn_cat, syn_log)
     feat_cols = syn_num + syn_cat + syn_log
     tr_fit = train_only_frame(aug)
@@ -168,7 +172,11 @@ def export_stage2_data(
 
     common = list(data.common_cols)
     buran_wide, m_bb = _export_cohort_wide(
-        data.reformatted, list(data.noise_num_bb), list(data.noise_log_bb), common
+        data.reformatted,
+        list(data.noise_num_bb),
+        list(data.noise_log_bb),
+        common,
+        has_strain=data.has_strain,
     )
     buran_wide["cohort"] = "buran"
     m_bb["cohort"] = "buran"
@@ -199,6 +207,7 @@ def export_stage2_data(
         list(data.noise_num_lib),
         list(data.noise_log_lib),
         common_lib,
+        has_strain=data.has_strain,
     )
     liberman_wide["cohort"] = "liberman"
     m_lib["cohort"] = "liberman"
