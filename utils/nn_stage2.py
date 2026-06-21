@@ -921,7 +921,7 @@ def run_two_stage_long_nn(
             weight_decay=cfg.weight_decay,
             huber=cfg.huber,
         )
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = next(model.parameters()).device
         model.eval()
         te_idx, X_te, y_te = prepare_long_xy(
             long_te, long_num, long_cat, long_log, prep, fit=False
@@ -946,7 +946,6 @@ def run_two_stage_long_nn(
             W_va_s = W_all[sh[:n_val]]
 
         model = CNNPlusTabular(X_sub.shape[1])
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         def fwd(m, xb, wb):
             return m(wb, xb)
@@ -966,6 +965,7 @@ def run_two_stage_long_nn(
             huber=cfg.huber,
             forward_fn=fwd,
         )
+        device = next(model.parameters()).device
         te_idx, X_te, y_te = prepare_long_xy(
             long_te, long_num, long_cat, long_log, prep, fit=False
         )
@@ -995,7 +995,6 @@ def run_two_stage_long_nn(
             W_va_s = W_all[sh[:n_val]]
 
         model = CNNPlusTabular(X_sub.shape[1])
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         def fwd_full(m, xb, wb):
             return m(wb, xb)
@@ -1015,6 +1014,7 @@ def run_two_stage_long_nn(
             huber=cfg.huber,
             forward_fn=fwd_full,
         )
+        device = next(model.parameters()).device
         te_idx, X_te, y_te = prepare_long_xy(
             long_te, long_num, long_cat, long_log, prep, fit=False
         )
