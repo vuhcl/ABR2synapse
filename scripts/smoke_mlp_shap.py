@@ -18,8 +18,8 @@ from utils.liberman_classical import liberman_feature_lists, stage2_feature_list
 from utils.nn_stage2_data import load_nn_stage2_data, splits_for_long_stage2
 from utils.stage2_hp import resolve_torch_device
 from utils.stage2_mlp_shap import (
-    _EXPECTED_N_FEATURES,
     compute_fold_shap,
+    expected_long_transformed_width,
     fit_mlp_fold,
     mlp_hp_for_scenario,
 )
@@ -83,9 +83,15 @@ def main() -> None:
         l_tr, l_ev, long_num, long_cat, long_log, hp,
         holdout_seed=holdout_seed, device=device,
     )
-    shap_df, feat_df = compute_fold_shap(art, holdout_seed=holdout_seed, shap_batch_size=32)
+    shap_df, feat_df = compute_fold_shap(
+        art,
+        holdout_seed=holdout_seed,
+        shap_batch_size=32,
+        max_background=200,
+    )
 
-    assert shap_df.shape[1] == _EXPECTED_N_FEATURES == 13, shap_df.shape
+    expected_n = expected_long_transformed_width(long_num, long_cat, long_log)
+    assert shap_df.shape[1] == expected_n, (shap_df.shape, expected_n)
     assert len(shap_df) == len(art.meta_eval)
     assert np.isfinite(shap_df.values).all()
 
